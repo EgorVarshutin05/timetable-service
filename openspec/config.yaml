@@ -1,0 +1,26 @@
+# OpenSpec: каталог инициализирован в scaffold (структура `openspec init`). Артефакты изменений —
+# proposal, specs (дельты), design, tasks — создаются в openspec/changes/<change-id>/ и коммитятся
+# вместе с кодом; завершённые изменения переносятся в openspec/changes/archive/.
+# Интеграцию с конкретным AI-инструментом (команды /opsx:*) добавляет `openspec init` в репозитории.
+schema: spec-driven
+
+context: |
+  Сервис timetable-service платформы учебного центра «WA» (тестовое задание, см. TASK.md).
+  Стек: Python 3.12, FastAPI или Sanic, SQLAlchemy 2.0 async + Alembic, PostgreSQL 16, uv,
+  pytest, mypy strict, ruff, Docker Compose; брокер — RabbitMQ или Kafka (переменная BROKER).
+  Нормативные контракты: openapi.yaml (HTTP), asyncapi.yaml (события),
+  stubs/people-stub/stub-openapi.yaml (соседний сервис).
+  Соглашения: единый формат ошибок {"error": {"code", "message", "details"}}, идентификаторы UUID v4,
+  время в ответах — ISO 8601 UTC с суффиксом Z, «сейчас» — только через app/clock.py (Clock).
+
+rules:
+  proposal:
+    - Ссылаться на идентификаторы требований задания (FR-xx, BR-xx) из TASK.md
+    - Называть trade-off и отвергнутые альтернативы, а не только выбранный вариант
+  specs:
+    - Каждое требование — с хотя бы одним сценарием WHEN/THEN, проверяемым тестом
+    - Коды ответов и коды ошибок — как в openapi.yaml
+  design:
+    - Указывать, в каком слое живут предметные правила и чем защищён каждый инвариант (домен, транзакция, ограничение БД)
+  tasks:
+    - Задачи не длиннее одного часа; отмечать фактически выполненные

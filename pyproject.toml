@@ -1,0 +1,129 @@
+[project]
+name = "timetable-service"
+version = "0.1.0"
+description = "Расписание занятий учебного центра «WA» с детектором конфликтов (тестовое задание)"
+readme = "README.md"
+authors = [{ name = "WA", email = "hello@wave-access.com" }]
+requires-python = ">=3.12"
+dependencies = [
+    # Каркас HTTP-слоя собран на FastAPI. При выборе Sanic замените fastapi/uvicorn и модули
+    # src/app/main.py, src/app/api/*, src/app/errors.py, src/app/context.py (см. SCAFFOLD.md).
+    "fastapi>=0.115",
+    "uvicorn[standard]>=0.30",
+    "pydantic>=2.7",
+    "pydantic-settings>=2.3",
+    # SQLAlchemy 2.0 — версия, зафиксированная в задании; 2.1 не используется намеренно.
+    "sqlalchemy[asyncio]>=2.0.36,<2.1",
+    "asyncpg>=0.29",
+    "alembic>=1.13",
+]
+
+# Обе группы ставятся по умолчанию (`uv sync`): mypy проверяет и tests/e2e. В образ они не попадают
+# (Dockerfile: --no-default-groups).
+[tool.uv]
+# Та же минорная версия, что в Dockerfile (ghcr.io/astral-sh/uv:0.13).
+required-version = ">=0.13"
+default-groups = ["dev", "e2e"]
+
+[dependency-groups]
+dev = [
+    "pytest>=8",
+    "pytest-asyncio>=0.24",
+    "httpx>=0.27",
+    "ruff>=0.6",
+    "mypy>=1.11",
+]
+# Группа e2e нужна только для запуска tests/e2e с хоста: оба брокера, валидация контракта.
+e2e = [
+    "httpx>=0.27",
+    "aio-pika>=9.4",
+    "aiokafka>=0.11",
+    "jsonschema>=4.23",
+    "referencing>=0.35",
+    "pyyaml>=6",
+    "types-pyyaml",
+    "types-jsonschema",
+]
+
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+# src-layout: пакет приложения — src/app; тесты импортируют установленный пакет, а не каталог из корня.
+[tool.hatch.build.targets.wheel]
+packages = ["src/app"]
+
+# ---------------------------------------------------------------------------
+# ruff — конфигурация scaffold. Не ослаблять: набор правил и line-length входят в критерий K6.
+# ---------------------------------------------------------------------------
+[tool.ruff]
+target-version = "py312"
+line-length = 100
+src = ["src", "."]
+extend-exclude = ["stubs"]
+
+[tool.ruff.lint]
+select = [
+    "E", "W",    # pycodestyle
+    "F",         # pyflakes
+    "I",         # isort
+    "UP",        # pyupgrade
+    "B",         # bugbear
+    "SIM",       # simplify
+    "ASYNC",     # блокирующие вызовы в async-коде
+    "C4",        # comprehensions
+    "PT",        # стиль pytest
+    "T20",       # print в коде приложения
+    "RUF",       # правила ruff
+]
+ignore = [
+    "RUF001", "RUF002", "RUF003",  # кириллица в строках, докстрингах и комментариях — норма проекта
+    "RUF012",                      # mutable class attributes: ложные срабатывания на pydantic/SQLAlchemy
+]
+
+[tool.ruff.lint.per-file-ignores]
+"tests/**" = ["T20"]
+# Консольные утилиты репозитория: вывод в stdout — их интерфейс.
+"tools/**" = ["T20"]
+
+[tool.ruff.lint.isort]
+known-first-party = ["app", "tests"]
+
+[tool.ruff.format]
+quote-style = "double"
+
+# ---------------------------------------------------------------------------
+# mypy — конфигурация scaffold. Не ослаблять: strict и перечисленные флаги входят в критерий K6.
+# Подавления (# type: ignore) допустимы только с кодом ошибки и комментарием «почему».
+# ---------------------------------------------------------------------------
+[tool.mypy]
+python_version = "3.12"
+files = ["src", "tests", "migrations", "tools"]
+mypy_path = "src"
+exclude = ["^stubs/"]
+strict = true
+warn_unreachable = true
+enable_error_code = ["ignore-without-code", "possibly-undefined", "truthy-bool"]
+plugins = ["pydantic.mypy"]
+
+[tool.pydantic-mypy]
+init_forbid_extra = true
+init_typed = true
+warn_required_dynamic_aliases = true
+
+# Сторонние пакеты без аннотаций типов. Список закрыт: добавление новых записей — только с объяснением в README.
+[[tool.mypy.overrides]]
+module = ["aiokafka", "aiokafka.*", "asyncpg", "asyncpg.*"]
+ignore_missing_imports = true
+
+# ---------------------------------------------------------------------------
+# pytest
+# ---------------------------------------------------------------------------
+[tool.pytest.ini_options]
+# По умолчанию — только модульные тесты; e2e запускаются явно: just e2e-public
+testpaths = ["tests/unit"]
+asyncio_mode = "auto"
+asyncio_default_fixture_loop_scope = "function"
+markers = [
+    "scenario(id, fr, must): e2e-сценарий; id — E2E-xx, fr — список FR, must — входит ли в порог приёмки",
+]

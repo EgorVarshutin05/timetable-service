@@ -1,0 +1,37 @@
+name: ci
+
+on:
+  push:
+  pull_request:
+
+jobs:
+  check:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: astral-sh/setup-uv@v5
+        with:
+          enable-cache: true
+      - name: Установить зависимости
+        run: uv sync --locked
+      # just ставится из PyPI (пакет rust-just) тем же uv — без отдельного менеджера пакетов.
+      - name: ruff
+        run: uvx --from rust-just just lint
+      - name: mypy
+        run: uvx --from rust-just just typecheck
+      - name: pytest
+        run: uvx --from rust-just just test
+      - name: Собрать образ приложения
+        run: docker build -t app:ci .
+
+  # История коммитов по CONTRIBUTING.md: нужна полная история с ветками и тегами.
+  lint-commits:
+    name: lint-commits
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+          fetch-tags: true
+      - name: Проверка истории коммитов (CONTRIBUTING.md)
+        run: python3 tools/lint_commits.py --base scaffold-base --head HEAD --strict

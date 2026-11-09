@@ -1,0 +1,274 @@
+openapi: 3.1.0
+info:
+  title: people-stub
+  version: 0.1.0
+  summary: Заглушка сервиса преподавателей и аудиторий учебного центра «WA»
+  description: |
+    Готовая заглушка, выдаётся в scaffold (`stubs/people-stub/`). Порт 8100. Данные — из `fixtures.json` в памяти,
+    состояние между запросами не хранится. Ответы детерминированы.
+
+    Режимы отказов (проверяются в указанном порядке, задержка `latency_ms` добавляется к каждому ответу).
+    Переменные окружения задают начальное состояние; e2e и проверяющий на дебрифе меняют режимы на лету через
+    `PUT /__stub/config` (без перезапуска) и возвращают их к окружению через `DELETE /__stub/config`.
+    Служебные эндпоинты `/__stub/*` и `/health` не подчиняются режимам отказа и задержке (кроме `down` для `/health`)
+    и не учитываются в `/__stub/stats`.
+
+    | Режим (поле config) | Окружение | Поведение |
+    | --- | --- | --- |
+    | `down` | `STUB_DOWN=1` | все предметные ответы и `/health` — 503 |
+    | `timeout_ids` | `STUB_TIMEOUT_IDS` — id через запятую | ответ задерживается на 10 с, затем обычный 200 |
+    | `fail_ids` | `STUB_FAIL_IDS` — id через запятую | 500 на все эндпоинты с этим id в пути |
+    | — (фикстура) | `"fail_availability": true` у преподавателя | `GET /instructors/{instructor_id}/availability` → 500, профиль → 200 |
+    | `latency_ms` | `STUB_LATENCY_MS` (по умолчанию 300) | каждый предметный ответ задерживается на N мс |
+
+    Значения в `docker-compose.yml` scaffold: `STUB_LATENCY_MS=300`,
+    `STUB_FAIL_IDS=1b000000-0000-4000-8000-000000000004,2c000000-0000-4000-8000-000000000004`,
+    `STUB_TIMEOUT_IDS=1b000000-0000-4000-8000-000000000005,2c000000-0000-4000-8000-000000000005`, `STUB_DOWN=0`.
+
+    Фикстуры: преподаватели `1b000000-0000-4000-8000-00000000000{1..6}` (6 — с `fail_availability`),
+    аудитории `2c000000-0000-4000-8000-00000000000{1..5}`.
+
+    Окна доступности заданы в местном времени преподавателя (`timezone`, IANA). `weekday` — ISO (1 = понедельник,
+    7 = воскресенье). Интервал окна `[from, to)`; `to` > `from`, окна не переходят через полночь.
+servers:
+  - url: http://people-stub:8100
+paths:
+  /instructors/{instructor_id}:
+    get:
+      operationId: getInstructor
+      summary: Профиль преподавателя
+      parameters:
+        - $ref: '#/components/parameters/InstructorId'
+      responses:
+        '200':
+          description: Профиль
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Instructor' }
+              example:
+                id: 1b000000-0000-4000-8000-000000000001
+                full_name: Анна Королёва
+                max_hours_per_day: 6
+                timezone: Asia/Yekaterinburg
+        '404': { $ref: '#/components/responses/NotFound' }
+        '500': { $ref: '#/components/responses/StubFailure' }
+        '503': { $ref: '#/components/responses/StubDown' }
+  /instructors/{instructor_id}/availability:
+    get:
+      operationId: getInstructorAvailability
+      summary: Недельные окна доступности преподавателя
+      parameters:
+        - $ref: '#/components/parameters/InstructorId'
+      responses:
+        '200':
+          description: Окна доступности
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Availability' }
+              example:
+                instructor_id: 1b000000-0000-4000-8000-000000000003
+                timezone: Europe/Moscow
+                windows:
+                  - { weekday: 2, from: '12:00', to: '20:00' }
+                  - { weekday: 4, from: '12:00', to: '20:00' }
+        '404': { $ref: '#/components/responses/NotFound' }
+        '500': { $ref: '#/components/responses/StubFailure' }
+        '503': { $ref: '#/components/responses/StubDown' }
+  /classrooms/{classroom_id}:
+    get:
+      operationId: getClassroom
+      summary: Аудитория
+      parameters:
+        - name: classroom_id
+          in: path
+          required: true
+          schema: { type: string, format: uuid }
+      responses:
+        '200':
+          description: Аудитория
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Classroom' }
+              example: { id: 2c000000-0000-4000-8000-000000000002, name: Ауд. 102, capacity: 10, online_capable: false }
+        '404': { $ref: '#/components/responses/NotFound' }
+        '500': { $ref: '#/components/responses/StubFailure' }
+        '503': { $ref: '#/components/responses/StubDown' }
+  /health:
+    get:
+      operationId: stubHealth
+      summary: Живость заглушки
+      responses:
+        '200':
+          description: Жива
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  status: { const: ok }
+        '503': { $ref: '#/components/responses/StubDown' }
+  /__stub/config:
+    get:
+      operationId: getStubConfig
+      summary: Текущие режимы заглушки
+      responses:
+        '200':
+          description: Режимы
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/StubConfig' }
+    put:
+      operationId: setStubConfig
+      summary: Изменить режимы на лету (частичное обновление, переданные поля заменяются)
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: '#/components/schemas/StubConfigPatch' }
+            example: { down: true }
+      responses:
+        '200':
+          description: Режимы после изменения
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/StubConfig' }
+        '422':
+          description: Невалидные значения
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/StubError' }
+    delete:
+      operationId: resetStubConfig
+      summary: Сбросить режимы к значениям переменных окружения
+      responses:
+        '200':
+          description: Режимы после сброса
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/StubConfig' }
+  /__stub/stats:
+    get:
+      operationId: getStubStats
+      summary: Счётчики вызовов с момента последнего сброса
+      responses:
+        '200':
+          description: Счётчики
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/StubStats' }
+              example:
+                total: 3
+                in_flight: 0
+                max_in_flight: 3
+                by_path:
+                  '/instructors/{instructor_id}': 1
+                  '/instructors/{instructor_id}/availability': 1
+                  '/classrooms/{classroom_id}': 1
+                by_id:
+                  1b000000-0000-4000-8000-000000000001: 2
+                  2c000000-0000-4000-8000-000000000001: 1
+    delete:
+      operationId: resetStubStats
+      summary: Обнулить счётчики (включая max_in_flight)
+      responses:
+        '204': { description: Счётчики сброшены }
+components:
+  parameters:
+    InstructorId:
+      name: instructor_id
+      in: path
+      required: true
+      schema: { type: string, format: uuid }
+  responses:
+    NotFound:
+      description: Сущность не найдена
+      content:
+        application/json:
+          schema: { $ref: '#/components/schemas/StubError' }
+          example: { error: { code: NOT_FOUND, message: Not found, details: {} } }
+    StubFailure:
+      description: Искусственный отказ (STUB_FAIL_IDS или fail_availability)
+      content:
+        application/json:
+          schema: { $ref: '#/components/schemas/StubError' }
+          example: { error: { code: STUB_FAILURE, message: Injected failure, details: {} } }
+    StubDown:
+      description: Полный отказ (STUB_DOWN=1)
+      content:
+        application/json:
+          schema: { $ref: '#/components/schemas/StubError' }
+          example: { error: { code: STUB_DOWN, message: Service unavailable, details: {} } }
+  schemas:
+    Instructor:
+      type: object
+      required: [id, full_name, max_hours_per_day, timezone]
+      properties:
+        id: { type: string, format: uuid }
+        full_name: { type: string }
+        max_hours_per_day: { type: number, exclusiveMinimum: 0 }
+        timezone: { type: string, description: IANA, например Asia/Yekaterinburg }
+    Availability:
+      type: object
+      required: [instructor_id, timezone, windows]
+      properties:
+        instructor_id: { type: string, format: uuid }
+        timezone: { type: string }
+        windows:
+          type: array
+          items:
+            type: object
+            required: [weekday, from, to]
+            properties:
+              weekday: { type: integer, minimum: 1, maximum: 7 }
+              from: { type: string, pattern: '^\d{2}:\d{2}$' }
+              to: { type: string, pattern: '^\d{2}:\d{2}$' }
+    Classroom:
+      type: object
+      required: [id, name, capacity, online_capable]
+      properties:
+        id: { type: string, format: uuid }
+        name: { type: string }
+        capacity: { type: integer, minimum: 1 }
+        online_capable: { type: boolean }
+    StubConfig:
+      type: object
+      required: [latency_ms, fail_ids, timeout_ids, down]
+      properties:
+        latency_ms: { type: integer, minimum: 0 }
+        fail_ids: { type: array, items: { type: string, format: uuid } }
+        timeout_ids: { type: array, items: { type: string, format: uuid } }
+        down: { type: boolean }
+    StubConfigPatch:
+      type: object
+      additionalProperties: false
+      properties:
+        latency_ms: { type: integer, minimum: 0 }
+        fail_ids: { type: array, items: { type: string, format: uuid } }
+        timeout_ids: { type: array, items: { type: string, format: uuid } }
+        down: { type: boolean }
+    StubStats:
+      type: object
+      required: [total, in_flight, max_in_flight, by_path, by_id]
+      properties:
+        total: { type: integer, minimum: 0, description: Число предметных запросов }
+        in_flight: { type: integer, minimum: 0, description: Запросов в обработке сейчас }
+        max_in_flight: { type: integer, minimum: 0, description: Максимум одновременных запросов с момента сброса }
+        by_path:
+          type: object
+          additionalProperties: { type: integer }
+          description: Шаблон пути → число вызовов
+        by_id:
+          type: object
+          additionalProperties: { type: integer }
+          description: Идентификатор из пути → число вызовов
+    StubError:
+      type: object
+      required: [error]
+      properties:
+        error:
+          type: object
+          required: [code, message, details]
+          properties:
+            code: { type: string }
+            message: { type: string }
+            details: { type: object }

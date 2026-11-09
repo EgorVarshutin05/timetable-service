@@ -1,0 +1,12 @@
+
+# <type>(<scope>)!: <description>   — английский, императив, ≤ 72 символов, без точки
+#
+# Тело: что изменилось и почему (не «как»). Отделяется пустой строкой.
+#
+# Footers (git trailers), последним абзацем через пустую строку:
+# Refs: FR-03, FR-07
+#
+# type:  feat fix refactor test docs spec build ci chore perf revert
+# scope: api domain db broker client jobs infra e2e readme openspec
+# «!» после type/scope — изменение контракта (openapi.yaml, asyncapi.yaml, схема БД);
+# объясняется в README «Решения». Подробнее — CONTRIBUTING.md §2.

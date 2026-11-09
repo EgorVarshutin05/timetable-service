@@ -1,0 +1,87 @@
+{
+  "instructors": [
+    {
+      "id": "1b000000-0000-4000-8000-000000000001",
+      "full_name": "Анна Королёва",
+      "max_hours_per_day": 6,
+      "timezone": "Asia/Yekaterinburg",
+      "windows": [
+        {"weekday": 1, "from": "09:00", "to": "18:00"},
+        {"weekday": 2, "from": "09:00", "to": "18:00"},
+        {"weekday": 3, "from": "09:00", "to": "18:00"},
+        {"weekday": 4, "from": "09:00", "to": "18:00"},
+        {"weekday": 5, "from": "09:00", "to": "18:00"}
+      ]
+    },
+    {
+      "id": "1b000000-0000-4000-8000-000000000002",
+      "full_name": "Борис Ефимов",
+      "max_hours_per_day": 4,
+      "timezone": "Asia/Yekaterinburg",
+      "windows": [
+        {"weekday": 1, "from": "09:00", "to": "18:00"},
+        {"weekday": 2, "from": "09:00", "to": "18:00"},
+        {"weekday": 3, "from": "09:00", "to": "18:00"},
+        {"weekday": 4, "from": "09:00", "to": "18:00"},
+        {"weekday": 5, "from": "09:00", "to": "18:00"}
+      ]
+    },
+    {
+      "id": "1b000000-0000-4000-8000-000000000003",
+      "full_name": "Вера Литвинова",
+      "max_hours_per_day": 8,
+      "timezone": "Europe/Moscow",
+      "windows": [
+        {"weekday": 2, "from": "12:00", "to": "20:00"},
+        {"weekday": 4, "from": "12:00", "to": "20:00"}
+      ]
+    },
+    {
+      "id": "1b000000-0000-4000-8000-000000000004",
+      "full_name": "Глеб Сорокин",
+      "max_hours_per_day": 6,
+      "timezone": "Asia/Yekaterinburg",
+      "windows": [
+        {"weekday": 1, "from": "09:00", "to": "18:00"},
+        {"weekday": 2, "from": "09:00", "to": "18:00"},
+        {"weekday": 3, "from": "09:00", "to": "18:00"},
+        {"weekday": 4, "from": "09:00", "to": "18:00"},
+        {"weekday": 5, "from": "09:00", "to": "18:00"}
+      ]
+    },
+    {
+      "id": "1b000000-0000-4000-8000-000000000005",
+      "full_name": "Дарья Миронова",
+      "max_hours_per_day": 6,
+      "timezone": "Asia/Yekaterinburg",
+      "windows": [
+        {"weekday": 1, "from": "09:00", "to": "18:00"},
+        {"weekday": 2, "from": "09:00", "to": "18:00"},
+        {"weekday": 3, "from": "09:00", "to": "18:00"},
+        {"weekday": 4, "from": "09:00", "to": "18:00"},
+        {"weekday": 5, "from": "09:00", "to": "18:00"}
+      ]
+    },
+    {
+      "id": "1b000000-0000-4000-8000-000000000006",
+      "full_name": "Егор Панов",
+      "max_hours_per_day": 6,
+      "timezone": "Asia/Yekaterinburg",
+      "fail_availability": true,
+      "windows": [
+        {"weekday": 1, "from": "09:00", "to": "18:00"},
+        {"weekday": 2, "from": "09:00", "to": "18:00"},
+        {"weekday": 3, "from": "09:00", "to": "18:00"},
+        {"weekday": 4, "from": "09:00", "to": "18:00"},
+        {"weekday": 5, "from": "09:00", "to": "18:00"}
+      ]
+    }
+  ],
+  "classrooms": [
+    {"id": "2c000000-0000-4000-8000-000000000001", "name": "Ауд. 101", "capacity": 30, "online_capable": true},
+    {"id": "2c000000-0000-4000-8000-000000000002", "name": "Ауд. 102", "capacity": 10, "online_capable": false},
+    {"id": "2c000000-0000-4000-8000-000000000003", "name": "Ауд. 201", "capacity": 20, "online_capable": true},
+    {"id": "2c000000-0000-4000-8000-000000000004", "name": "Ауд. 202", "capacity": 20, "online_capable": true},
+    {"id": "2c000000-0000-4000-8000-000000000005", "name": "Ауд. 301", "capacity": 20, "online_capable": false}
+  ]
+}

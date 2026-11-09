@@ -1,0 +1,800 @@
+openapi: 3.1.0
+info:
+  title: timetable-service
+  version: 0.1.0
+  summary: Расписание занятий учебного центра «WA» с детектором конфликтов
+  description: |
+    Нормативный контракт сервиса `timetable-service` (тестовое задание «Расписание и конфликты», версия 0.1, 2026-11-09).
+
+    Соглашения:
+    - Идентификаторы — UUID v4. Время в ответах — ISO 8601 в UTC с суффиксом `Z`; во входных данных — ISO 8601 со смещением
+      (значение без смещения → 422 `VALIDATION_ERROR`).
+    - Ошибки — единый формат `Error`. Перечень кодов — `x-error-codes` в корне и у операций.
+    - Пагинация: `limit` (по умолчанию 50, максимум 200), `offset` (по умолчанию 0) → `{items, total}`.
+    - Невалидный JSON или неверный тип поля → 400 `BAD_REQUEST`. 404 `NOT_FOUND` — только для ресурса из пути;
+      ссылка в теле на несуществующую сущность → 422 `<ENTITY>_NOT_FOUND`. Заголовок `X-Role` не требуется (ролевой логики нет).
+    - Эндпоинты тега `test-mode` доступны только при `TEST_MODE=1`, иначе 404 `NOT_FOUND`.
+    - Операции с `x-priority: should` или `x-priority: could` не входят в обязательную часть.
+servers:
+  - url: http://localhost:8000
+tags:
+  - name: lessons
+    description: Занятия и их жизненный цикл
+  - name: groups
+    description: Учебные группы (данные из seed)
+  - name: instructors
+    description: Производные отчёты по преподавателям (Should)
+  - name: health
+    description: Проверки живости и готовности
+  - name: test-mode
+    description: Тестовые эндпоинты; только при TEST_MODE=1
+
+x-error-codes:
+  BAD_REQUEST: { http: 400, description: "Синтаксически невалидный запрос: невалидный JSON, неверный тип поля" }
+  NOT_FOUND: { http: 404, description: Ресурс по пути не найден; неизвестное имя фоновой задачи; тестовые эндпоинты при TEST_MODE=0 }
+  VALIDATION_ERROR: { http: 422, description: "Семантически невалидные данные; details.fields — словарь «поле → сообщение». BR-01, ONLINE с classroom_id, время без смещения, limit > 200" }
+  CLASSROOM_REQUIRED: { http: 422, description: BR-02 — IN_PERSON без classroom_id }
+  GROUP_NOT_FOUND: { http: 422, description: BR-03 — группа из тела запроса не существует }
+  INSTRUCTOR_NOT_FOUND: { http: 422, description: BR-03 — преподаватель из тела запроса не существует в people-stub }
+  CLASSROOM_NOT_FOUND: { http: 422, description: BR-03 — аудитория из тела запроса не существует в people-stub }
+  CLASSROOM_TOO_SMALL: { http: 409, description: "BR-04 — вместимость аудитории меньше размера группы; details: capacity, group_size" }
+  SCHEDULE_CONFLICT: { http: 409, description: "BR-05 — пересечение с активным занятием; details.conflicts[]" }
+  LESSON_NOT_FINISHED: { http: 409, description: "BR-08 — complete до ends_at; details: ends_at, now" }
+  TRANSITION_FORBIDDEN: { http: 409, description: "Недопустимый переход статуса; details: current_status, target_status" }
+  LESSON_NOT_EDITABLE: { http: 409, description: "PATCH занятия не в статусе PLANNED; details: current_status" }
+  UPSTREAM_UNAVAILABLE: { http: 502, description: people-stub ответил 5xx или недоступен }
+  UPSTREAM_TIMEOUT: { http: 504, description: people-stub не ответил за STUB_TIMEOUT_MS }
+
+x-warning-codes:
+  WORKLOAD_SOFT_LIMIT: "BR-06 — превышение max_hours_per_day; details: date, max_hours, planned_hours"
+  INSTRUCTOR_UNAVAILABLE: "BR-07 — занятие вне окон доступности преподавателя; details: instructor_id"
+
+paths:
+  /lessons:
+    post:
+      tags: [lessons]
+      operationId: createLesson
+      summary: Создать занятие (FR-01)
+      description: |
+        Проверяет BR-01…BR-07 в порядке таблицы правил; при успехе создаёт занятие в статусе PLANNED.
+        Мягкие правила возвращаются в `warnings` и не блокируют создание.
+      x-fr: FR-01
+      x-error-codes: [BAD_REQUEST, VALIDATION_ERROR, CLASSROOM_REQUIRED, GROUP_NOT_FOUND, INSTRUCTOR_NOT_FOUND, CLASSROOM_NOT_FOUND, CLASSROOM_TOO_SMALL, SCHEDULE_CONFLICT, UPSTREAM_UNAVAILABLE, UPSTREAM_TIMEOUT]
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: '#/components/schemas/LessonCreate' }
+      responses:
+        '201':
+          description: Занятие создано
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/LessonWithWarnings' }
+        '400': { $ref: '#/components/responses/BadRequest' }
+        '409': { $ref: '#/components/responses/Conflict' }
+        '422': { $ref: '#/components/responses/Unprocessable' }
+        '502': { $ref: '#/components/responses/UpstreamUnavailable' }
+        '504': { $ref: '#/components/responses/UpstreamTimeout' }
+    get:
+      tags: [lessons]
+      operationId: listLessons
+      summary: Список занятий с фильтрами (FR-03)
+      description: |
+        Фильтр периода — по `starts_at`: `starts_at >= from` и `starts_at < to`. Фильтры объединяются по И.
+        Сортировка: `starts_at` по возрастанию, затем `id`.
+      x-fr: FR-03
+      x-error-codes: [VALIDATION_ERROR]
+      parameters:
+        - { name: group_id, in: query, schema: { type: string, format: uuid } }
+        - { name: instructor_id, in: query, schema: { type: string, format: uuid } }
+        - { name: classroom_id, in: query, schema: { type: string, format: uuid } }
+        - { name: status, in: query, schema: { $ref: '#/components/schemas/LessonStatus' } }
+        - { name: from, in: query, schema: { type: string, format: date-time } }
+        - { name: to, in: query, schema: { type: string, format: date-time } }
+        - { $ref: '#/components/parameters/Limit' }
+        - { $ref: '#/components/parameters/Offset' }
+      responses:
+        '200':
+          description: Страница занятий
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/LessonPage' }
+        '422': { $ref: '#/components/responses/Unprocessable' }
+
+  /lessons/validate:
+    post:
+      tags: [lessons]
+      operationId: validateLesson
+      summary: Проверить занятие без создания (FR-02)
+      description: |
+        Та же проверка, что в `POST /lessons`, без создания записи и без событий.
+        Нарушения, которые в `POST /lessons` дают 409, возвращаются в `violations` с ответом 200.
+        Нарушения, которые дают 422, 502, 504, возвращаются тем же кодом ответа.
+      x-fr: FR-02
+      x-error-codes: [BAD_REQUEST, VALIDATION_ERROR, CLASSROOM_REQUIRED, GROUP_NOT_FOUND, INSTRUCTOR_NOT_FOUND, CLASSROOM_NOT_FOUND, UPSTREAM_UNAVAILABLE, UPSTREAM_TIMEOUT]
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: '#/components/schemas/LessonCreate' }
+      responses:
+        '200':
+          description: Результат проверки
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/ValidationResult' }
+        '400': { $ref: '#/components/responses/BadRequest' }
+        '422': { $ref: '#/components/responses/Unprocessable' }
+        '502': { $ref: '#/components/responses/UpstreamUnavailable' }
+        '504': { $ref: '#/components/responses/UpstreamTimeout' }
+
+  /lessons/{lesson_id}:
+    parameters:
+      - $ref: '#/components/parameters/LessonId'
+    get:
+      tags: [lessons]
+      operationId: getLesson
+      summary: Занятие по идентификатору (FR-04)
+      x-fr: FR-04
+      x-error-codes: [NOT_FOUND]
+      responses:
+        '200':
+          description: Занятие
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Lesson' }
+        '404': { $ref: '#/components/responses/NotFound' }
+    patch:
+      tags: [lessons]
+      operationId: updateLesson
+      summary: Изменить занятие в статусе PLANNED (FR-05)
+      description: |
+        Частичное изменение. Переданные поля сливаются с текущим состоянием; результат проходит BR-01…BR-07,
+        само изменяемое занятие в проверке конфликтов не участвует. Статус через PATCH не меняется.
+        Проверка статуса выполняется раньше проверки правил.
+      x-fr: FR-05
+      x-error-codes: [BAD_REQUEST, NOT_FOUND, LESSON_NOT_EDITABLE, VALIDATION_ERROR, CLASSROOM_REQUIRED, INSTRUCTOR_NOT_FOUND, CLASSROOM_NOT_FOUND, CLASSROOM_TOO_SMALL, SCHEDULE_CONFLICT, UPSTREAM_UNAVAILABLE, UPSTREAM_TIMEOUT]
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: '#/components/schemas/LessonPatch' }
+      responses:
+        '200':
+          description: Занятие изменено
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/LessonWithWarnings' }
+        '400': { $ref: '#/components/responses/BadRequest' }
+        '404': { $ref: '#/components/responses/NotFound' }
+        '409': { $ref: '#/components/responses/Conflict' }
+        '422': { $ref: '#/components/responses/Unprocessable' }
+        '502': { $ref: '#/components/responses/UpstreamUnavailable' }
+        '504': { $ref: '#/components/responses/UpstreamTimeout' }
+
+  /lessons/{lesson_id}/confirm:
+    parameters:
+      - $ref: '#/components/parameters/LessonId'
+    post:
+      tags: [lessons]
+      operationId: confirmLesson
+      summary: Подтвердить занятие PLANNED → CONFIRMED (FR-06)
+      description: Публикует событие `LessonConfirmed` после фиксации изменения.
+      x-fr: FR-06
+      x-events: [LessonConfirmed]
+      x-error-codes: [NOT_FOUND, TRANSITION_FORBIDDEN]
+      responses:
+        '200':
+          description: Занятие подтверждено
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Lesson' }
+        '404': { $ref: '#/components/responses/NotFound' }
+        '409': { $ref: '#/components/responses/Conflict' }
+
+  /lessons/{lesson_id}/cancel:
+    parameters:
+      - $ref: '#/components/parameters/LessonId'
+    post:
+      tags: [lessons]
+      operationId: cancelLesson
+      summary: Отменить занятие PLANNED|CONFIRMED → CANCELLED (FR-07)
+      description: Тело необязательно. Публикует событие `LessonCancelled` после фиксации изменения.
+      x-fr: FR-07
+      x-events: [LessonCancelled]
+      x-error-codes: [BAD_REQUEST, NOT_FOUND, TRANSITION_FORBIDDEN, VALIDATION_ERROR]
+      requestBody:
+        required: false
+        content:
+          application/json:
+            schema: { $ref: '#/components/schemas/CancelRequest' }
+      responses:
+        '200':
+          description: Занятие отменено
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Lesson' }
+        '400': { $ref: '#/components/responses/BadRequest' }
+        '404': { $ref: '#/components/responses/NotFound' }
+        '409': { $ref: '#/components/responses/Conflict' }
+        '422': { $ref: '#/components/responses/Unprocessable' }
+
+  /lessons/{lesson_id}/reschedule:
+    parameters:
+      - $ref: '#/components/parameters/LessonId'
+    post:
+      tags: [lessons]
+      operationId: rescheduleLesson
+      summary: Перенести занятие (FR-08)
+      description: |
+        Атомарно переводит исходное занятие (PLANNED или CONFIRMED) в RESCHEDULED и создаёт новое занятие
+        в статусе PLANNED с той же группой и `rescheduled_from_id` = исходное. Незаданные поля
+        (`instructor_id`, `classroom_id`, `format`) берутся из исходного занятия. Новое занятие проходит BR-01…BR-07,
+        исходное в проверке конфликтов не участвует. У занятия не более одного переноса.
+        Проверка статуса выполняется раньше проверки правил. Публикует `LessonRescheduled`.
+        Ответ содержит новое занятие.
+      x-fr: FR-08
+      x-events: [LessonRescheduled]
+      x-error-codes: [BAD_REQUEST, NOT_FOUND, TRANSITION_FORBIDDEN, VALIDATION_ERROR, CLASSROOM_REQUIRED, INSTRUCTOR_NOT_FOUND, CLASSROOM_NOT_FOUND, CLASSROOM_TOO_SMALL, SCHEDULE_CONFLICT, UPSTREAM_UNAVAILABLE, UPSTREAM_TIMEOUT]
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: '#/components/schemas/RescheduleRequest' }
+      responses:
+        '201':
+          description: Создано новое занятие
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/LessonWithWarnings' }
+        '400': { $ref: '#/components/responses/BadRequest' }
+        '404': { $ref: '#/components/responses/NotFound' }
+        '409': { $ref: '#/components/responses/Conflict' }
+        '422': { $ref: '#/components/responses/Unprocessable' }
+        '502': { $ref: '#/components/responses/UpstreamUnavailable' }
+        '504': { $ref: '#/components/responses/UpstreamTimeout' }
+
+  /lessons/{lesson_id}/complete:
+    parameters:
+      - $ref: '#/components/parameters/LessonId'
+    post:
+      tags: [lessons]
+      operationId: completeLesson
+      summary: Завершить занятие IN_PROGRESS → COMPLETED (FR-09)
+      description: Допустимо только при `now >= ends_at` по часам сервиса (BR-08). Проверка перехода выполняется раньше BR-08.
+      x-fr: FR-09
+      x-error-codes: [NOT_FOUND, TRANSITION_FORBIDDEN, LESSON_NOT_FINISHED]
+      responses:
+        '200':
+          description: Занятие завершено
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Lesson' }
+        '404': { $ref: '#/components/responses/NotFound' }
+        '409': { $ref: '#/components/responses/Conflict' }
+
+  /lesson-series:
+    post:
+      tags: [lessons]
+      operationId: createLessonSeries
+      summary: Создать серию занятий (FR-14, Should)
+      description: |
+        Генерирует `count` занятий по дням недели `weekdays` (UTC-дата), начиная с даты и времени `first_starts_at`
+        (первое занятие — в день `first_starts_at`, если он входит в `weekdays`, иначе в ближайший подходящий день),
+        длительностью `duration_minutes`. Каждое занятие проходит BR-01…BR-07, включая конфликты внутри серии.
+        Всё или ничего: при нарушении hard-правила ни одно занятие не создаётся; `details.occurrence_index` —
+        номер первого нарушившего занятия (с 0). Занятия серии получают общий `series_id`.
+      x-priority: should
+      x-fr: FR-14
+      x-error-codes: [BAD_REQUEST, VALIDATION_ERROR, CLASSROOM_REQUIRED, GROUP_NOT_FOUND, INSTRUCTOR_NOT_FOUND, CLASSROOM_NOT_FOUND, CLASSROOM_TOO_SMALL, SCHEDULE_CONFLICT, UPSTREAM_UNAVAILABLE, UPSTREAM_TIMEOUT]
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: '#/components/schemas/LessonSeriesCreate' }
+      responses:
+        '201':
+          description: Серия создана
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/LessonSeriesResult' }
+        '400': { $ref: '#/components/responses/BadRequest' }
+        '409': { $ref: '#/components/responses/Conflict' }
+        '422': { $ref: '#/components/responses/Unprocessable' }
+        '502': { $ref: '#/components/responses/UpstreamUnavailable' }
+        '504': { $ref: '#/components/responses/UpstreamTimeout' }
+
+  /groups:
+    get:
+      tags: [groups]
+      operationId: listGroups
+      summary: Список групп (FR-16, Could)
+      description: Сортировка по `name`, затем `id`.
+      x-priority: could
+      x-fr: FR-16
+      x-error-codes: [VALIDATION_ERROR]
+      parameters:
+        - { $ref: '#/components/parameters/Limit' }
+        - { $ref: '#/components/parameters/Offset' }
+      responses:
+        '200':
+          description: Страница групп
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/GroupPage' }
+        '422': { $ref: '#/components/responses/Unprocessable' }
+
+  /groups/{group_id}:
+    parameters:
+      - name: group_id
+        in: path
+        required: true
+        schema: { type: string, format: uuid }
+    get:
+      tags: [groups]
+      operationId: getGroup
+      summary: Группа по идентификатору (FR-11)
+      x-fr: FR-11
+      x-error-codes: [NOT_FOUND]
+      responses:
+        '200':
+          description: Группа
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Group' }
+        '404': { $ref: '#/components/responses/NotFound' }
+
+  /instructors/{instructor_id}/workload:
+    parameters:
+      - name: instructor_id
+        in: path
+        required: true
+        schema: { type: string, format: uuid }
+    get:
+      tags: [instructors]
+      operationId: getInstructorWorkload
+      summary: Нагрузка преподавателя за неделю (FR-15, Should)
+      description: |
+        Часы активных занятий преподавателя по дням ISO-недели и признак превышения `max_hours_per_day`.
+        День определяется так же, как в BR-06. Неизвестный преподаватель → 404 `NOT_FOUND`.
+      x-priority: should
+      x-fr: FR-15
+      x-error-codes: [NOT_FOUND, VALIDATION_ERROR, UPSTREAM_UNAVAILABLE, UPSTREAM_TIMEOUT]
+      parameters:
+        - name: week
+          in: query
+          required: true
+          schema: { type: string, pattern: '^\d{4}-W\d{2}$', examples: ['2026-W49'] }
+      responses:
+        '200':
+          description: Нагрузка
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Workload' }
+        '404': { $ref: '#/components/responses/NotFound' }
+        '422': { $ref: '#/components/responses/Unprocessable' }
+        '502': { $ref: '#/components/responses/UpstreamUnavailable' }
+        '504': { $ref: '#/components/responses/UpstreamTimeout' }
+
+  /health/live:
+    get:
+      tags: [health]
+      operationId: healthLive
+      summary: Процесс жив
+      responses:
+        '200':
+          description: Жив
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [status]
+                properties:
+                  status: { const: ok }
+
+  /health/ready:
+    get:
+      tags: [health]
+      operationId: healthReady
+      summary: Готовность (БД и брокер)
+      description: Заглушка в проверку готовности не входит.
+      responses:
+        '200':
+          description: Все зависимости доступны
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Readiness' }
+              example: { status: ok, db: ok, broker: ok }
+        '503':
+          description: Хотя бы одна зависимость недоступна
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Readiness' }
+              example: { status: degraded, db: ok, broker: fail }
+
+  /__test/time:
+    get:
+      tags: [test-mode]
+      operationId: testGetTime
+      summary: Текущее время часов сервиса
+      x-error-codes: [NOT_FOUND]
+      responses:
+        '200':
+          description: Время
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/TestTime' }
+        '404': { $ref: '#/components/responses/NotFound' }
+    put:
+      tags: [test-mode]
+      operationId: testSetTime
+      summary: Установить и зафиксировать время часов сервиса
+      x-error-codes: [BAD_REQUEST, NOT_FOUND, VALIDATION_ERROR]
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: '#/components/schemas/TestTime' }
+      responses:
+        '200':
+          description: Время установлено
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/TestTime' }
+        '400': { $ref: '#/components/responses/BadRequest' }
+        '404': { $ref: '#/components/responses/NotFound' }
+        '422': { $ref: '#/components/responses/Unprocessable' }
+    delete:
+      tags: [test-mode]
+      operationId: testResetTime
+      summary: Вернуть системные часы
+      x-error-codes: [NOT_FOUND]
+      responses:
+        '204': { description: Часы сброшены }
+        '404': { $ref: '#/components/responses/NotFound' }
+
+  /__test/jobs/{job_name}/run:
+    post:
+      tags: [test-mode]
+      operationId: testRunJob
+      summary: Синхронно выполнить фоновую задачу (FR-10)
+      description: |
+        Поддерживаемая задача — `lesson-status-sweeper`. Неизвестное имя → 404 `NOT_FOUND`.
+        При `TEST_MODE=1` периодический запуск отключён; при `TEST_MODE=0` задача запускается с интервалом
+        `JOBS_INTERVAL_SECONDS` (по умолчанию 30, не более 60), а этот эндпоинт отвечает 404.
+      x-fr: FR-10
+      x-error-codes: [NOT_FOUND]
+      parameters:
+        - name: job_name
+          in: path
+          required: true
+          schema: { type: string, examples: [lesson-status-sweeper] }
+      responses:
+        '200':
+          description: Задача выполнена
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [processed]
+                properties:
+                  processed: { type: integer, minimum: 0, description: Число занятий, переведённых в IN_PROGRESS }
+        '404': { $ref: '#/components/responses/NotFound' }
+
+  /__test/reset:
+    post:
+      tags: [test-mode]
+      operationId: testReset
+      summary: Очистить данные и выполнить seed
+      description: Часы сервиса не меняются.
+      x-error-codes: [NOT_FOUND]
+      responses:
+        '204': { description: Данные сброшены }
+        '404': { $ref: '#/components/responses/NotFound' }
+
+components:
+  parameters:
+    LessonId:
+      name: lesson_id
+      in: path
+      required: true
+      schema: { type: string, format: uuid }
+    Limit:
+      name: limit
+      in: query
+      schema: { type: integer, minimum: 1, maximum: 200, default: 50 }
+      description: Значение вне диапазона → 422 VALIDATION_ERROR
+    Offset:
+      name: offset
+      in: query
+      schema: { type: integer, minimum: 0, default: 0 }
+
+  responses:
+    BadRequest:
+      description: Синтаксически невалидный запрос
+      content:
+        application/json:
+          schema: { $ref: '#/components/schemas/Error' }
+          example: { error: { code: BAD_REQUEST, message: "Невалидный JSON", details: {} } }
+    NotFound:
+      description: Ресурс не найден
+      content:
+        application/json:
+          schema: { $ref: '#/components/schemas/Error' }
+          example: { error: { code: NOT_FOUND, message: "Занятие не найдено", details: { lesson_id: 3d000000-0000-4000-8000-000000000099 } } }
+    Conflict:
+      description: Конфликт состояния или нарушение инварианта
+      content:
+        application/json:
+          schema: { $ref: '#/components/schemas/Error' }
+          examples:
+            scheduleConflict:
+              value:
+                error:
+                  code: SCHEDULE_CONFLICT
+                  message: Пересечение с другим занятием
+                  details:
+                    conflicts:
+                      - resource: instructor
+                        lesson_id: 3d000000-0000-4000-8000-000000000001
+                        overlap: { starts_at: '2026-12-01T06:00:00Z', ends_at: '2026-12-01T06:30:00Z' }
+            classroomTooSmall:
+              value: { error: { code: CLASSROOM_TOO_SMALL, message: Аудитория мала для группы, details: { capacity: 10, group_size: 25 } } }
+            transitionForbidden:
+              value: { error: { code: TRANSITION_FORBIDDEN, message: Недопустимый переход, details: { current_status: PLANNED, target_status: COMPLETED } } }
+            notEditable:
+              value: { error: { code: LESSON_NOT_EDITABLE, message: Изменять можно только занятие в статусе PLANNED, details: { current_status: CONFIRMED } } }
+            notFinished:
+              value: { error: { code: LESSON_NOT_FINISHED, message: Занятие ещё не закончилось, details: { ends_at: '2026-11-30T05:30:00Z', now: '2026-11-30T04:10:00Z' } } }
+    Unprocessable:
+      description: Семантически невалидные данные
+      content:
+        application/json:
+          schema: { $ref: '#/components/schemas/Error' }
+          examples:
+            validation:
+              value: { error: { code: VALIDATION_ERROR, message: Невалидные данные, details: { fields: { ends_at: "Должно быть позже starts_at" } } } }
+            classroomRequired:
+              value: { error: { code: CLASSROOM_REQUIRED, message: Для очного занятия нужна аудитория, details: {} } }
+            instructorNotFound:
+              value: { error: { code: INSTRUCTOR_NOT_FOUND, message: Преподаватель не найден, details: { instructor_id: 1b000000-0000-4000-8000-000000000099 } } }
+    UpstreamUnavailable:
+      description: Отказ people-stub
+      content:
+        application/json:
+          schema: { $ref: '#/components/schemas/Error' }
+          example: { error: { code: UPSTREAM_UNAVAILABLE, message: Сервис людей и аудиторий недоступен, details: { upstream: people-stub } } }
+    UpstreamTimeout:
+      description: Таймаут people-stub
+      content:
+        application/json:
+          schema: { $ref: '#/components/schemas/Error' }
+          example: { error: { code: UPSTREAM_TIMEOUT, message: Сервис людей и аудиторий не ответил вовремя, details: { upstream: people-stub, timeout_ms: 2000 } } }
+
+  schemas:
+    Error:
+      type: object
+      required: [error]
+      additionalProperties: false
+      properties:
+        error:
+          type: object
+          required: [code, message, details]
+          properties:
+            code:
+              type: string
+              pattern: '^[A-Z][A-Z0-9_]*$'
+              enum: [BAD_REQUEST, NOT_FOUND, VALIDATION_ERROR, CLASSROOM_REQUIRED, GROUP_NOT_FOUND, INSTRUCTOR_NOT_FOUND, CLASSROOM_NOT_FOUND, CLASSROOM_TOO_SMALL, SCHEDULE_CONFLICT, LESSON_NOT_FINISHED, TRANSITION_FORBIDDEN, LESSON_NOT_EDITABLE, UPSTREAM_UNAVAILABLE, UPSTREAM_TIMEOUT]
+            message: { type: string }
+            details: { type: object }
+
+    LessonStatus:
+      type: string
+      enum: [PLANNED, CONFIRMED, IN_PROGRESS, COMPLETED, CANCELLED, RESCHEDULED]
+
+    LessonFormat:
+      type: string
+      enum: [IN_PERSON, ONLINE]
+
+    UtcDateTime:
+      type: string
+      format: date-time
+      pattern: 'Z$'
+      description: ISO 8601 в UTC с суффиксом Z
+
+    Lesson:
+      type: object
+      required: [id, group_id, instructor_id, classroom_id, format, starts_at, ends_at, status, rescheduled_from_id, cancel_reason, created_at, updated_at]
+      properties:
+        id: { type: string, format: uuid }
+        group_id: { type: string, format: uuid }
+        instructor_id: { type: string, format: uuid }
+        classroom_id: { type: [string, 'null'], format: uuid }
+        format: { $ref: '#/components/schemas/LessonFormat' }
+        starts_at: { $ref: '#/components/schemas/UtcDateTime' }
+        ends_at: { $ref: '#/components/schemas/UtcDateTime' }
+        status: { $ref: '#/components/schemas/LessonStatus' }
+        rescheduled_from_id: { type: [string, 'null'], format: uuid }
+        cancel_reason: { type: [string, 'null'] }
+        series_id:
+          type: [string, 'null']
+          format: uuid
+          description: Только при реализации FR-14 (Should); иначе поле может отсутствовать
+        created_at: { $ref: '#/components/schemas/UtcDateTime' }
+        updated_at: { $ref: '#/components/schemas/UtcDateTime' }
+
+    LessonCreate:
+      type: object
+      required: [group_id, instructor_id, format, starts_at, ends_at]
+      additionalProperties: false
+      properties:
+        group_id: { type: string, format: uuid }
+        instructor_id: { type: string, format: uuid }
+        classroom_id:
+          type: [string, 'null']
+          format: uuid
+          description: Обязателен для IN_PERSON (BR-02); для ONLINE — null или отсутствует
+        format: { $ref: '#/components/schemas/LessonFormat' }
+        starts_at: { type: string, format: date-time, description: ISO 8601 со смещением }
+        ends_at: { type: string, format: date-time, description: ISO 8601 со смещением }
+
+    LessonPatch:
+      type: object
+      additionalProperties: false
+      minProperties: 1
+      description: Любое подмножество полей; group_id и status не изменяются
+      properties:
+        instructor_id: { type: string, format: uuid }
+        classroom_id: { type: [string, 'null'], format: uuid }
+        format: { $ref: '#/components/schemas/LessonFormat' }
+        starts_at: { type: string, format: date-time }
+        ends_at: { type: string, format: date-time }
+
+    RescheduleRequest:
+      type: object
+      required: [starts_at, ends_at]
+      additionalProperties: false
+      properties:
+        starts_at: { type: string, format: date-time }
+        ends_at: { type: string, format: date-time }
+        instructor_id: { type: string, format: uuid, description: По умолчанию — как у исходного }
+        classroom_id: { type: [string, 'null'], format: uuid, description: По умолчанию — как у исходного }
+        format: { $ref: '#/components/schemas/LessonFormat' }
+
+    CancelRequest:
+      type: object
+      additionalProperties: false
+      properties:
+        reason: { type: [string, 'null'], maxLength: 500 }
+
+    Warning:
+      type: object
+      required: [code, message, details]
+      properties:
+        code:
+          type: string
+          pattern: '^[A-Z][A-Z0-9_]*$'
+          description: WORKLOAD_SOFT_LIMIT, INSTRUCTOR_UNAVAILABLE (см. x-warning-codes); перечень открыт для расширения
+        message: { type: string }
+        details: { type: object }
+      examples:
+        - code: WORKLOAD_SOFT_LIMIT
+          message: Превышена дневная норма преподавателя
+          details: { date: '2026-12-01', max_hours: 4, planned_hours: 4.5 }
+
+    Violation:
+      type: object
+      required: [code, message, details]
+      properties:
+        code: { type: string, enum: [CLASSROOM_TOO_SMALL, SCHEDULE_CONFLICT] }
+        message: { type: string }
+        details: { type: object }
+
+    LessonWithWarnings:
+      type: object
+      required: [lesson, warnings]
+      properties:
+        lesson: { $ref: '#/components/schemas/Lesson' }
+        warnings:
+          type: array
+          items: { $ref: '#/components/schemas/Warning' }
+
+    ValidationResult:
+      type: object
+      required: [ok, violations, warnings]
+      properties:
+        ok: { type: boolean, description: "true, если violations пуст" }
+        violations:
+          type: array
+          items: { $ref: '#/components/schemas/Violation' }
+        warnings:
+          type: array
+          items: { $ref: '#/components/schemas/Warning' }
+
+    LessonPage:
+      type: object
+      required: [items, total]
+      properties:
+        items:
+          type: array
+          items: { $ref: '#/components/schemas/Lesson' }
+        total: { type: integer, minimum: 0 }
+
+    Group:
+      type: object
+      required: [id, name, size]
+      properties:
+        id: { type: string, format: uuid }
+        name: { type: string }
+        size: { type: integer, minimum: 1, description: Число слушателей }
+
+    GroupPage:
+      type: object
+      required: [items, total]
+      properties:
+        items:
+          type: array
+          items: { $ref: '#/components/schemas/Group' }
+        total: { type: integer, minimum: 0 }
+
+    LessonSeriesCreate:
+      type: object
+      required: [group_id, instructor_id, format, weekdays, count, first_starts_at, duration_minutes]
+      additionalProperties: false
+      properties:
+        group_id: { type: string, format: uuid }
+        instructor_id: { type: string, format: uuid }
+        classroom_id: { type: [string, 'null'], format: uuid }
+        format: { $ref: '#/components/schemas/LessonFormat' }
+        weekdays:
+          type: array
+          minItems: 1
+          uniqueItems: true
+          items: { type: string, enum: [MON, TUE, WED, THU, FRI, SAT, SUN] }
+        count: { type: integer, minimum: 1, maximum: 50 }
+        first_starts_at: { type: string, format: date-time }
+        duration_minutes: { type: integer, minimum: 30, maximum: 480 }
+
+    LessonSeriesResult:
+      type: object
+      required: [series_id, items]
+      properties:
+        series_id: { type: string, format: uuid }
+        items:
+          type: array
+          items: { $ref: '#/components/schemas/LessonWithWarnings' }
+
+    Workload:
+      type: object
+      required: [instructor_id, week, max_hours_per_day, days]
+      properties:
+        instructor_id: { type: string, format: uuid }
+        week: { type: string, examples: ['2026-W49'] }
+        max_hours_per_day: { type: number }
+        days:
+          type: array
+          minItems: 7
+          maxItems: 7
+          items:
+            type: object
+            required: [date, hours, exceeded]
+            properties:
+              date: { type: string, format: date }
+              hours: { type: number, minimum: 0 }
+              exceeded: { type: boolean }
+
+    Readiness:
+      type: object
+      required: [status, db, broker]
+      properties:
+        status: { type: string, enum: [ok, degraded] }
+        db: { type: string, enum: [ok, fail] }
+        broker: { type: string, enum: [ok, fail] }
+
+    TestTime:
+      type: object
+      required: [now]
+      additionalProperties: false
+      properties:
+        now: { type: string, format: date-time }

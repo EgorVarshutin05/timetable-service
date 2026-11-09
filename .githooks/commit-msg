@@ -1,0 +1,13 @@
+#!/bin/sh
+# Хук commit-msg: проверка сообщения коммита по CONTRIBUTING.md.
+# Включается рецептом `just setup` (git config core.hooksPath .githooks).
+# Merge-коммит в master проверяется с footers Change/Refs; обратное слияние master
+# в ветку change/* не проверяется — для него допустимо сообщение git по умолчанию.
+branch="$(git symbolic-ref --quiet --short HEAD 2>/dev/null || true)"
+if git rev-parse --quiet --verify MERGE_HEAD >/dev/null 2>&1; then
+  if [ "$branch" = "master" ]; then
+    exec python3 tools/lint_commits.py --message-file "$1" --merge
+  fi
+  exit 0
+fi
+exec python3 tools/lint_commits.py --message-file "$1"

@@ -1,0 +1,197 @@
+asyncapi: 3.0.0
+info:
+  title: timetable-service events
+  version: 0.1.0
+  description: |
+    События, которые публикует `timetable-service`. Брокер — RabbitMQ или Kafka (переменная `BROKER`).
+
+    - RabbitMQ: topic exchange `wa.events`, routing key `timetable.<EventType>`; сообщение — JSON-конверт,
+      `content_type=application/json`, `message_id` = `event_id`, `delivery_mode=2`.
+    - Kafka: топик `wa.timetable.events`, ключ сообщения — `payload.lesson_id` (идентификатор исходного занятия),
+      значение — JSON-конверт; заголовок `event_type`.
+
+    Событие публикуется только после фиксации изменения в БД и только при успешной операции.
+    `occurred_at` — время по часам сервиса (`Clock`) в момент операции.
+    `idempotency_key` = `<event-type-kebab>:<lesson_id>`: `lesson-confirmed:<lesson_id>`, `lesson-cancelled:<lesson_id>`,
+    `lesson-rescheduled:<lesson_id>` (каждое событие для занятия возможно не более одного раза).
+    Потребители трактуют ключ как непрозрачную строку и дедуплицируют по нему.
+    Доставка at-least-once: публикация сразу после commit допустима (Must); transactional outbox не требуется.
+defaultContentType: application/json
+
+servers:
+  rabbitmq:
+    host: rabbitmq:5672
+    protocol: amqp
+    description: Профиль compose `rabbitmq`
+  kafka:
+    host: kafka:9092
+    protocol: kafka
+    description: Профиль compose `kafka`
+
+channels:
+  lessonConfirmed:
+    address: timetable.LessonConfirmed
+    description: RabbitMQ routing key в exchange `wa.events`; в Kafka — топик `wa.timetable.events`
+    messages:
+      LessonConfirmed: { $ref: '#/components/messages/LessonConfirmed' }
+    bindings:
+      amqp: { is: routingKey, exchange: { name: wa.events, type: topic, durable: true } }
+  lessonCancelled:
+    address: timetable.LessonCancelled
+    description: RabbitMQ routing key в exchange `wa.events`; в Kafka — топик `wa.timetable.events`
+    messages:
+      LessonCancelled: { $ref: '#/components/messages/LessonCancelled' }
+    bindings:
+      amqp: { is: routingKey, exchange: { name: wa.events, type: topic, durable: true } }
+  lessonRescheduled:
+    address: timetable.LessonRescheduled
+    description: RabbitMQ routing key в exchange `wa.events`; в Kafka — топик `wa.timetable.events`
+    messages:
+      LessonRescheduled: { $ref: '#/components/messages/LessonRescheduled' }
+    bindings:
+      amqp: { is: routingKey, exchange: { name: wa.events, type: topic, durable: true } }
+  timetableEventsKafka:
+    address: wa.timetable.events
+    description: Kafka-топик со всеми событиями сервиса; ключ — payload.lesson_id
+    messages:
+      LessonConfirmed: { $ref: '#/components/messages/LessonConfirmed' }
+      LessonCancelled: { $ref: '#/components/messages/LessonCancelled' }
+      LessonRescheduled: { $ref: '#/components/messages/LessonRescheduled' }
+
+operations:
+  publishLessonConfirmed:
+    action: send
+    channel: { $ref: '#/channels/lessonConfirmed' }
+    summary: POST /lessons/{lesson_id}/confirm (FR-06)
+  publishLessonCancelled:
+    action: send
+    channel: { $ref: '#/channels/lessonCancelled' }
+    summary: POST /lessons/{lesson_id}/cancel (FR-07)
+  publishLessonRescheduled:
+    action: send
+    channel: { $ref: '#/channels/lessonRescheduled' }
+    summary: POST /lessons/{lesson_id}/reschedule (FR-08)
+  publishToKafka:
+    action: send
+    channel: { $ref: '#/channels/timetableEventsKafka' }
+    summary: Все события при BROKER=kafka
+
+components:
+  messages:
+    LessonConfirmed:
+      name: LessonConfirmed
+      payload:
+        allOf:
+          - $ref: '#/components/schemas/Envelope'
+          - type: object
+            properties:
+              event_type: { const: LessonConfirmed }
+              payload: { $ref: '#/components/schemas/LessonConfirmedPayload' }
+      examples:
+        - payload:
+            event_id: 5e1d6a2c-8b1f-4c3e-9a77-0c2f3b4d5e6f
+            event_type: LessonConfirmed
+            occurred_at: '2026-11-30T03:00:00Z'
+            idempotency_key: 'lesson-confirmed:3d000000-0000-4000-8000-000000000001'
+            producer: timetable-service
+            version: 1
+            payload:
+              lesson_id: 3d000000-0000-4000-8000-000000000001
+              group_id: 9a000000-0000-4000-8000-000000000001
+              instructor_id: 1b000000-0000-4000-8000-000000000001
+              classroom_id: 2c000000-0000-4000-8000-000000000001
+              format: IN_PERSON
+              starts_at: '2026-12-01T05:00:00Z'
+              ends_at: '2026-12-01T06:30:00Z'
+    LessonCancelled:
+      name: LessonCancelled
+      payload:
+        allOf:
+          - $ref: '#/components/schemas/Envelope'
+          - type: object
+            properties:
+              event_type: { const: LessonCancelled }
+              payload: { $ref: '#/components/schemas/LessonCancelledPayload' }
+    LessonRescheduled:
+      name: LessonRescheduled
+      payload:
+        allOf:
+          - $ref: '#/components/schemas/Envelope'
+          - type: object
+            properties:
+              event_type: { const: LessonRescheduled }
+              payload: { $ref: '#/components/schemas/LessonRescheduledPayload' }
+      examples:
+        - payload:
+            event_id: 7a8b9c0d-1e2f-4a3b-8c4d-5e6f7a8b9c0d
+            event_type: LessonRescheduled
+            occurred_at: '2026-11-30T03:00:00Z'
+            idempotency_key: 'lesson-rescheduled:3d000000-0000-4000-8000-000000000001'
+            producer: timetable-service
+            version: 1
+            payload:
+              lesson_id: 3d000000-0000-4000-8000-000000000001
+              rescheduled_to_id: 0f6c2b1e-3d4a-4b5c-9d6e-7f8a9b0c1d2e
+              group_id: 9a000000-0000-4000-8000-000000000001
+              instructor_id: 1b000000-0000-4000-8000-000000000001
+              previous: { starts_at: '2026-12-01T05:00:00Z', ends_at: '2026-12-01T06:30:00Z', instructor_id: 1b000000-0000-4000-8000-000000000001, classroom_id: 2c000000-0000-4000-8000-000000000001 }
+              new: { starts_at: '2026-12-04T05:00:00Z', ends_at: '2026-12-04T06:30:00Z', instructor_id: 1b000000-0000-4000-8000-000000000001, classroom_id: 2c000000-0000-4000-8000-000000000001 }
+
+  schemas:
+    Envelope:
+      type: object
+      description: Общий конверт событий платформы
+      required: [event_id, event_type, occurred_at, idempotency_key, producer, version, payload]
+      additionalProperties: false
+      properties:
+        event_id: { type: string, format: uuid }
+        event_type: { type: string, enum: [LessonConfirmed, LessonCancelled, LessonRescheduled] }
+        occurred_at: { type: string, format: date-time, pattern: 'Z$' }
+        idempotency_key: { type: string, pattern: '^lesson-(confirmed|cancelled|rescheduled):[0-9a-f-]{36}$' }
+        producer: { const: timetable-service }
+        version: { const: 1 }
+        payload: { type: object }
+
+    Interval:
+      type: object
+      required: [starts_at, ends_at, instructor_id, classroom_id]
+      properties:
+        starts_at: { type: string, format: date-time }
+        ends_at: { type: string, format: date-time }
+        instructor_id: { type: string, format: uuid }
+        classroom_id: { type: [string, 'null'], format: uuid }
+
+    LessonConfirmedPayload:
+      type: object
+      required: [lesson_id, group_id, instructor_id, classroom_id, format, starts_at, ends_at]
+      properties:
+        lesson_id: { type: string, format: uuid }
+        group_id: { type: string, format: uuid }
+        instructor_id: { type: string, format: uuid }
+        classroom_id: { type: [string, 'null'], format: uuid }
+        format: { type: string, enum: [IN_PERSON, ONLINE] }
+        starts_at: { type: string, format: date-time }
+        ends_at: { type: string, format: date-time }
+
+    LessonCancelledPayload:
+      type: object
+      required: [lesson_id, group_id, instructor_id, starts_at, ends_at, previous_status, reason]
+      properties:
+        lesson_id: { type: string, format: uuid }
+        group_id: { type: string, format: uuid }
+        instructor_id: { type: string, format: uuid }
+        starts_at: { type: string, format: date-time }
+        ends_at: { type: string, format: date-time }
+        previous_status: { type: string, enum: [PLANNED, CONFIRMED] }
+        reason: { type: [string, 'null'] }
+
+    LessonRescheduledPayload:
+      type: object
+      required: [lesson_id, rescheduled_to_id, group_id, instructor_id, previous, new]
+      properties:
+        lesson_id: { type: string, format: uuid, description: Исходное занятие (теперь RESCHEDULED) }
+        rescheduled_to_id: { type: string, format: uuid, description: Новое занятие (PLANNED) }
+        group_id: { type: string, format: uuid }
+        instructor_id: { type: string, format: uuid, description: Преподаватель исходного занятия }
+        previous: { $ref: '#/components/schemas/Interval' }
+        new: { $ref: '#/components/schemas/Interval' }

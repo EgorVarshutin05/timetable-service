@@ -1,0 +1,25 @@
+# Python
+__pycache__/
+*.py[cod]
+.venv/
+.mypy_cache/
+.pytest_cache/
+.ruff_cache/
+*.egg-info/
+dist/
+build/
+
+# Локальные переопределения переменных: образец — .env.example (в репозитории),
+# значения по умолчанию заданы в docker-compose.yml и src/app/settings.py.
+.env
+
+# Отчёты и локальные артефакты
+e2e-report.json
+*.bundle
+.coverage
+htmlcov/
+
+# IDE
+.idea/
+.vscode/
+*.swp
