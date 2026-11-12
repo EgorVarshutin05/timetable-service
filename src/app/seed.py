@@ -10,12 +10,18 @@ import asyncio
 import json
 import logging
 import sys
+from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any
+from uuid import UUID
 
-from sqlalchemy.ext.asyncio import AsyncSession
+from pydantic import AwareDatetime, BaseModel, ConfigDict, Field, field_validator
+from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 
-from app.db import make_engine, make_session_factory
+from app.db import make_engine, make_session_factory, session_scope
+from app.domain.lesson import LessonFormat, LessonStatus
+from app.models import Group, Lesson
+from app.repositories.seed import clear_data, insert_missing
 from app.settings import get_settings
 
 # Корень репозитория: src/app/seed.py → parents[2]. В образе это /app (editable-установка пакета).
@@ -24,6 +30,38 @@ SEED_DIR = Path(__file__).resolve().parents[2] / "seed"
 log = logging.getLogger(__name__)
 
 SeedRecords = list[dict[str, Any]]
+
+
+class SeedGroup(BaseModel):
+    """Проверка формы seed, без запросов к people-stub и предметных правил."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    id: UUID
+    name: str
+    size: int = Field(ge=1)
+
+
+class SeedLesson(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    id: UUID
+    group_id: UUID
+    instructor_id: UUID
+    classroom_id: UUID | None
+    format: LessonFormat
+    starts_at: AwareDatetime
+    ends_at: AwareDatetime
+    status: LessonStatus
+    rescheduled_from_id: UUID | None
+    cancel_reason: str | None
+    created_at: AwareDatetime
+    updated_at: AwareDatetime
+
+    @field_validator("starts_at", "ends_at", "created_at", "updated_at")
+    @classmethod
+    def normalize_utc(cls, value: datetime) -> datetime:
+        return value.astimezone(UTC)
 
 
 def read_seed_file(name: str, seed_dir: Path = SEED_DIR) -> SeedRecords:
@@ -51,13 +89,19 @@ def read_all(seed_dir: Path = SEED_DIR) -> dict[str, SeedRecords]:
 
 
 async def load_seed(session: AsyncSession, data: dict[str, SeedRecords]) -> None:
-    """Записать seed в БД поверх пустых таблиц.
+    """Добавить отсутствующие UUID, не перезаписывая существующие записи; commit у вызывающего."""
+    groups = [SeedGroup.model_validate(row).model_dump() for row in data["groups"]]
+    lessons = [SeedLesson.model_validate(row).model_dump() for row in data["lessons"]]
+    await insert_missing(session, Group, groups)
+    await insert_missing(session, Lesson, lessons)
 
-    Реализуется автором сервиса после появления моделей. Договорённости: прямые INSERT без доменной
-    валидации, фиксированные UUID из файлов, идемпотентность.
-    """
-    msg = "Загрузчик seed не реализован: см. src/app/seed.py и TASK.md, §3.5"
-    raise NotImplementedError(msg)
+
+async def reset_data(factory: async_sessionmaker[AsyncSession], seed_dir: Path = SEED_DIR) -> None:
+    """Очистить и восстановить данные одной транзакцией; часы не являются зависимостью."""
+    data = await asyncio.to_thread(read_all, seed_dir)
+    async with session_scope(factory) as session:
+        await clear_data(session)
+        await load_seed(session, data)
 
 
 async def main() -> int:
@@ -66,7 +110,7 @@ async def main() -> int:
     logging.basicConfig(level=settings.log_level.upper())
     engine = make_engine(settings.database_url)
     factory = make_session_factory(engine)
-    data = read_all()
+    data = await asyncio.to_thread(read_all)
     log.info("Прочитан seed: %s", {name: len(rows) for name, rows in data.items()})
     try:
         async with factory() as session:

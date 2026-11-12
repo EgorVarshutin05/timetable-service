@@ -1,8 +1,7 @@
 """Точка входа приложения: сборка FastAPI, lifespan, подключение роутеров.
 
-Это каркас. Он поднимает процесс с БД, часами, реестром фоновых задач и служебными эндпоинтами.
-Предметные роутеры, модели, клиент заглушки и издатель событий добавляются автором сервиса;
-место для их подключения помечено комментариями ``# ---> точка расширения``.
+Поднимает процесс с БД, часами, seed, чтением ресурсов и служебными эндпоинтами.
+Клиент people-stub, издатель событий и предметные команды добавляются следующими пакетами.
 """
 
 import asyncio
@@ -12,13 +11,14 @@ from contextlib import asynccontextmanager
 
 from fastapi import FastAPI
 
-from app.api import health, testing
+from app.api import groups, health, lessons, testing
 from app.broker import UnconfiguredBrokerProbe
 from app.clock import AdjustableClock
 from app.context import AppContext
 from app.db import make_engine, make_session_factory
 from app.errors import install_error_handlers
 from app.jobs import JobRegistry, run_periodically
+from app.seed import load_seed, read_all, reset_data
 from app.settings import Settings, get_settings
 
 log = logging.getLogger(__name__)
@@ -36,9 +36,13 @@ def build_context(settings: Settings) -> AppContext:
         broker_probe=UnconfiguredBrokerProbe(),
         jobs=JobRegistry(),
     )
+
     # ---> точка расширения: регистрация фоновых задач, например
     # context.jobs.register("<job-name>", <корутина, возвращающая int>)
-    # ---> точка расширения: context.reset_state = <очистка таблиц + загрузка seed>
+    async def reset_state() -> None:
+        await reset_data(context.session_factory)
+
+    context.reset_state = reset_state
     return context
 
 
@@ -52,14 +56,19 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
 
     stop = asyncio.Event()
     periodic: asyncio.Task[None] | None = None
-    if settings.test_mode:
-        log.info("TEST_MODE=1: /__test/* включены, периодические задачи отключены")
-    else:
-        periodic = asyncio.create_task(
-            run_periodically(context.jobs, settings.jobs_interval_seconds, stop),
-            name="periodic-jobs",
-        )
     try:
+        if settings.seed_on_start:
+            data = await asyncio.to_thread(read_all)
+            async with context.session_factory() as session:
+                await load_seed(session, data)
+                await session.commit()
+        if settings.test_mode:
+            log.info("TEST_MODE=1: /__test/* включены, периодические задачи отключены")
+        else:
+            periodic = asyncio.create_task(
+                run_periodically(context.jobs, settings.jobs_interval_seconds, stop),
+                name="periodic-jobs",
+            )
         yield
     finally:
         stop.set()
@@ -80,6 +89,8 @@ def create_app() -> FastAPI:
     install_error_handlers(app)
     app.include_router(health.router)
     app.include_router(testing.router)
+    app.include_router(groups.router)
+    app.include_router(lessons.router)
     # ---> точка расширения: app.include_router(<предметный роутер>)
     return app
 
