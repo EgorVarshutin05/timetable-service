@@ -46,6 +46,17 @@ curl -s localhost:8000/health/ready
 
 | Пакет | Оценка задания, ч | Моя оценка до старта, ч | Факт, ч | Куда ушло время (при факте ≥ 2× и ≥ +1 ч) |
 | --- | --- | --- | --- | --- |
-| WP-00 Процесс | | | | |
-| wp01-… | | | | |
-| Итого | | | | |
+| WP-00 Процесс | 0,75 | 0,75 | 0,50 | |
+| wp01-load-seed-data | 0,80 | 1,00 | | |
+| wp02-add-people-client | 0,75 | 0,75 | | |
+| wp03-detect-lesson-conflicts | 1,75 | 2,00 | | |
+| wp04-list-and-edit-lessons | 0,80 | 1,00 | | |
+| wp05-manage-lesson-lifecycle | 1,50 | 1,75 | | |
+| wp06-publish-lesson-events | 0,70 | 0,75 | | |
+| wp07-finalize-docs | 0,40 | 0,50 | | |
+| Итого Must, включая WP-00 | 7,45 | 8,50 | | |
+| wp08-create-lesson-series | 1,00 | 1,25 | | |
+| wp09-report-instructor-workload | 0,50 | 0,75 | | |
+| wp10-list-groups-cache-people | 0,50 | 0,75 | | |
+| Итого Should/Could | 2,00 | 2,75 | | |
+| Итого | 9,45 | 11,25 | | |
