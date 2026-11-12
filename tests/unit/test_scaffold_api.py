@@ -86,6 +86,16 @@ async def test_test_endpoints_hidden_when_test_mode_off() -> None:
     assert response.json()["error"]["code"] == "NOT_FOUND"
 
 
+async def test_reset_hidden_when_test_mode_off() -> None:
+    app, _ = _build_app(test_mode=False)
+    async with httpx.AsyncClient(
+        transport=httpx.ASGITransport(app=app), base_url="http://test"
+    ) as http:
+        response = await http.post("/__test/reset")
+    assert response.status_code == 404
+    assert response.json()["error"]["code"] == "NOT_FOUND"
+
+
 async def test_time_set_get_reset(client: tuple[httpx.AsyncClient, AppContext]) -> None:
     http, context = client
 
@@ -150,7 +160,7 @@ async def test_jobs_run_registered_and_unknown(
     assert missing.json()["error"]["code"] == "NOT_FOUND"
 
 
-async def test_reset_not_implemented_in_scaffold(
+async def test_reset_without_handler_reports_not_implemented(
     client: tuple[httpx.AsyncClient, AppContext],
 ) -> None:
     http, _ = client
