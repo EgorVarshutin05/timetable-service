@@ -7,6 +7,7 @@ from fastapi import Request
 from sqlalchemy.ext.asyncio import AsyncEngine, AsyncSession, async_sessionmaker
 
 from app.broker import BrokerProbe
+from app.clients.people import PeopleClient
 from app.clock import AdjustableClock
 from app.jobs import JobRegistry
 from app.settings import Settings
@@ -25,6 +26,8 @@ class AppContext:
     # POST /__test/reset: очистка данных и повторный seed; подключается в build_context.
     # None позволяет собирать изолированные тестовые контексты без подключения к БД.
     reset_state: Callable[[], Awaitable[None]] | None = None
+    # В build_context всегда подключён; None допускается в изолированных API-тестах.
+    people_client: PeopleClient | None = None
 
 
 def get_context(request: Request) -> AppContext:

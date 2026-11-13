@@ -1,18 +1,20 @@
 """Точка входа приложения: сборка FastAPI, lifespan, подключение роутеров.
 
 Поднимает процесс с БД, часами, seed, чтением ресурсов и служебными эндпоинтами.
-Клиент people-stub, издатель событий и предметные команды добавляются следующими пакетами.
+Клиент people-stub закрывается вместе с ресурсами процесса.
+Издатель событий и предметные команды добавляются следующими пакетами.
 """
 
 import asyncio
 import logging
 from collections.abc import AsyncIterator
-from contextlib import asynccontextmanager
+from contextlib import AsyncExitStack, asynccontextmanager
 
 from fastapi import FastAPI
 
 from app.api import groups, health, lessons, testing
 from app.broker import UnconfiguredBrokerProbe
+from app.clients.people import PeopleClient
 from app.clock import AdjustableClock
 from app.context import AppContext
 from app.db import make_engine, make_session_factory
@@ -35,6 +37,7 @@ def build_context(settings: Settings) -> AppContext:
         # ---> точка расширения: реальная проверка брокера (вместе с издателем событий).
         broker_probe=UnconfiguredBrokerProbe(),
         jobs=JobRegistry(),
+        people_client=PeopleClient(settings),
     )
 
     # ---> точка расширения: регистрация фоновых задач, например
@@ -54,27 +57,30 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
     context = build_context(settings)
     app.state.context = context
 
-    stop = asyncio.Event()
-    periodic: asyncio.Task[None] | None = None
-    try:
-        if settings.seed_on_start:
-            data = await asyncio.to_thread(read_all)
-            async with context.session_factory() as session:
-                await load_seed(session, data)
-                await session.commit()
-        if settings.test_mode:
-            log.info("TEST_MODE=1: /__test/* включены, периодические задачи отключены")
-        else:
-            periodic = asyncio.create_task(
-                run_periodically(context.jobs, settings.jobs_interval_seconds, stop),
-                name="periodic-jobs",
-            )
-        yield
-    finally:
-        stop.set()
-        if periodic is not None:
-            await periodic
-        await context.engine.dispose()
+    async with AsyncExitStack() as cleanup:
+        cleanup.push_async_callback(context.engine.dispose)
+        if context.people_client is not None:
+            cleanup.push_async_callback(context.people_client.aclose)
+        stop = asyncio.Event()
+        periodic: asyncio.Task[None] | None = None
+        try:
+            if settings.seed_on_start:
+                data = await asyncio.to_thread(read_all)
+                async with context.session_factory() as session:
+                    await load_seed(session, data)
+                    await session.commit()
+            if settings.test_mode:
+                log.info("TEST_MODE=1: /__test/* включены, периодические задачи отключены")
+            else:
+                periodic = asyncio.create_task(
+                    run_periodically(context.jobs, settings.jobs_interval_seconds, stop),
+                    name="periodic-jobs",
+                )
+            yield
+        finally:
+            stop.set()
+            if periodic is not None:
+                await periodic
 
 
 def create_app() -> FastAPI:
