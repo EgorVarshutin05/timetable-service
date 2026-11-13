@@ -9,6 +9,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.context import AppContext, get_context
 from app.errors import ApiError
+from app.services.lessons import LessonService
 
 Context = Annotated[AppContext, Depends(get_context)]
 
@@ -44,3 +45,12 @@ def lesson_id_from_path(lesson_id: str) -> UUID:
 
 GroupId = Annotated[UUID, Depends(group_id_from_path)]
 LessonId = Annotated[UUID, Depends(lesson_id_from_path)]
+
+
+def get_lesson_service(context: Context) -> LessonService:
+    if context.people_client is None:
+        raise RuntimeError("people_client не подключён")
+    return LessonService(context.session_factory, context.people_client, context.clock)
+
+
+Lessons = Annotated[LessonService, Depends(get_lesson_service)]

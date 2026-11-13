@@ -36,6 +36,7 @@ _SYNTACTIC_ERROR_TYPES: frozenset[str] = frozenset(
         "bool_type",
         "bool_parsing",
         "uuid_type",
+        "uuid_parsing",
         "datetime_type",
         "date_type",
         "none_required",
