@@ -19,7 +19,7 @@ class Base(DeclarativeBase):
 
 def make_engine(database_url: str) -> AsyncEngine:
     """Создать движок. ``pool_pre_ping`` — чтобы readiness не держал мёртвые соединения."""
-    return create_async_engine(database_url, pool_pre_ping=True)
+    return create_async_engine(database_url, pool_pre_ping=True, isolation_level="READ COMMITTED")
 
 
 def make_session_factory(engine: AsyncEngine) -> async_sessionmaker[AsyncSession]:
