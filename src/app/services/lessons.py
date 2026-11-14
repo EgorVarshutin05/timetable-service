@@ -1,5 +1,6 @@
 """FR-01/02: порядок проверок, транзакция и создание только после успешных правил."""
 
+from collections.abc import Callable
 from datetime import UTC
 from typing import Protocol
 from uuid import UUID, uuid4
@@ -9,6 +10,7 @@ from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 from app.clock import Clock
 from app.db import session_scope
 from app.domain.lesson import LessonFormat, LessonStatus
+from app.domain.listing import LessonFilters, validate_filters
 from app.domain.people import LessonPeople
 from app.domain.scheduling import (
     Assessment,
@@ -18,13 +20,16 @@ from app.domain.scheduling import (
     availability_warning,
     capacity_violation,
     conflict_violation,
+    ensure_editable,
     validate_early,
     workload_span,
     workload_warnings,
 )
-from app.errors import ApiError
+from app.errors import ApiError, not_found
 from app.models import Lesson
-from app.repositories import scheduling
+from app.repositories import listing, scheduling
+
+DraftUpdate = Callable[[DraftLesson], DraftLesson]
 
 
 class PeopleSource(Protocol):
@@ -39,6 +44,23 @@ def _as_error(issue: Issue, status: int) -> ApiError:
 
 def _group_missing(group_id: UUID) -> ApiError:
     return ApiError(422, "GROUP_NOT_FOUND", "Группа не найдена", {"group_id": str(group_id)})
+
+
+def _editable(lesson: Lesson | None, lesson_id: UUID) -> Lesson:
+    if lesson is None:
+        raise not_found("Занятие не найдено", lesson_id=str(lesson_id))
+    try:
+        ensure_editable(lesson.status)
+    except InvalidLesson as exc:
+        raise _as_error(exc.issue, 409) from exc
+    return lesson
+
+
+def _validated(draft: DraftLesson) -> DraftLesson:
+    try:
+        return validate_early(draft)
+    except InvalidLesson as exc:
+        raise _as_error(exc.issue, 422) from exc
 
 
 async def assess(
@@ -77,13 +99,61 @@ class LessonService:
     ) -> None:
         self.factory, self.people, self.clock = factory, people, clock
 
+    async def list_lessons(self, filters: LessonFilters) -> tuple[list[Lesson], int]:
+        try:
+            filters = validate_filters(filters)
+        except InvalidLesson as exc:
+            raise _as_error(exc.issue, 422) from exc
+        async with self.factory() as session:
+            # Только чтение: total/items видят один снимок; запись остаётся READ COMMITTED.
+            await session.connection(execution_options={"isolation_level": "REPEATABLE READ"})
+            return await listing.get_page(session, filters)
+
+    async def patch(self, lesson_id: UUID, apply: DraftUpdate) -> tuple[Lesson, Assessment]:
+        while True:
+            async with self.factory() as session:
+                current = _editable(await scheduling.get_lesson(session, lesson_id), lesson_id)
+                old = scheduling.lesson_draft(current)
+            # Синтаксис JSON уже разобран, но значения PATCH и BR проверяются только после статуса.
+            draft = _validated(apply(old))
+            people = await self.people.get_lesson_people(
+                instructor_id=draft.instructor_id,
+                lesson_format=draft.format,
+                classroom_id=draft.classroom_id,
+            )
+            async with session_scope(self.factory) as session:
+                await scheduling.lock_resources(session, old, draft)
+                lesson = _editable(
+                    await scheduling.get_lesson(session, lesson_id, lock=True), lesson_id
+                )
+                if scheduling.lesson_draft(lesson) != old:
+                    # Конкурентный PATCH изменил снимок. __aexit__ освободит locks до нового HTTP.
+                    continue
+                group = await scheduling.get_group(session, draft.group_id, lock=True)
+                if group is None:
+                    raise _group_missing(draft.group_id)
+                report = await assess(
+                    session,
+                    draft,
+                    group.size,
+                    people,
+                    exclude_lesson_id=lesson_id,
+                    collect_all=False,
+                )
+                lesson.instructor_id = draft.instructor_id
+                lesson.classroom_id = draft.classroom_id
+                lesson.format = draft.format
+                lesson.starts_at = draft.starts_at
+                lesson.ends_at = draft.ends_at
+                lesson.updated_at = self.clock.now().astimezone(UTC)
+                await session.flush()
+                # Возврат завершается после commit в session_scope.__aexit__.
+                return lesson, report
+
     async def execute(
         self, draft: DraftLesson, *, dry_run: bool
     ) -> tuple[Lesson | None, Assessment]:
-        try:
-            draft = validate_early(draft)
-        except InvalidLesson as exc:
-            raise _as_error(exc.issue, 422) from exc
+        draft = _validated(draft)
         # Короткая сессия: группа проверяется до HTTP; соединение на время HTTP освобождено.
         async with self.factory() as session:
             if await scheduling.get_group(session, draft.group_id) is None:
