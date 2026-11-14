@@ -14,6 +14,9 @@ x-app-env: &app-env
   DATABASE_URL: ${DATABASE_URL:-postgresql+asyncpg://wa:wa@postgres:5432/wa}
   BROKER: ${BROKER:-rabbitmq}
   BROKER_URL: ${BROKER_URL:-amqp://wa:wa@rabbitmq:5672/}
+  RABBITMQ_EXCHANGE: ${RABBITMQ_EXCHANGE:-wa.events}
+  KAFKA_TOPIC: ${KAFKA_TOPIC:-wa.timetable.events}
+  BROKER_TIMEOUT_MS: ${BROKER_TIMEOUT_MS:-2000}
   STUB_BASE_URL: ${STUB_BASE_URL:-http://people-stub:8100}
   STUB_TIMEOUT_MS: ${STUB_TIMEOUT_MS:-2000}
   TEST_MODE: ${TEST_MODE:-1}
