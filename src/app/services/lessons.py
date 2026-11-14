@@ -7,8 +7,10 @@ from uuid import UUID, uuid4
 
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 
+from app.broker import EventPublisher
 from app.clock import Clock
 from app.db import session_scope
+from app.domain import events
 from app.domain.lesson import LessonFormat, LessonStatus
 from app.domain.lifecycle import ensure_complete, ensure_transition
 from app.domain.listing import LessonFilters, validate_filters
@@ -106,18 +108,31 @@ async def assess(
 
 class LessonService:
     def __init__(
-        self, factory: async_sessionmaker[AsyncSession], people: PeopleSource, clock: Clock
+        self,
+        factory: async_sessionmaker[AsyncSession],
+        people: PeopleSource,
+        clock: Clock,
+        publisher: EventPublisher | None = None,
     ) -> None:
         self.factory, self.people, self.clock = factory, people, clock
+        # None — только для прямых изолированных тестов прежних пакетов.
+        self.publisher = publisher
 
     async def _transition(
         self, lesson_id: UUID, target: LessonStatus, reason: str | None = None
     ) -> Lesson:
+        event: events.LessonEvent | None = None
         async with session_scope(self.factory) as session:
             lesson = _transitionable(
                 await scheduling.get_lesson(session, lesson_id, lock=True), lesson_id, target
             )
             now = self.clock.now().astimezone(UTC)
+            if target == LessonStatus.CONFIRMED:
+                event = events.confirmed(lesson.id, scheduling.lesson_draft(lesson), now)
+            elif target == LessonStatus.CANCELLED:
+                event = events.cancelled(
+                    lesson.id, scheduling.lesson_draft(lesson), lesson.status, reason, now
+                )
             if target == LessonStatus.COMPLETED:
                 try:
                     ensure_complete(lesson.status, lesson.ends_at, now)
@@ -128,16 +143,16 @@ class LessonService:
             if target == LessonStatus.CANCELLED:
                 lesson.cancel_reason = reason
             await session.flush()
+        if event is not None and self.publisher is not None:
+            await self.publisher.publish(event)
         return lesson
 
     async def confirm(self, lesson_id: UUID) -> Lesson:
         lesson = await self._transition(lesson_id, LessonStatus.CONFIRMED)
-        # WP-06: публикация LessonConfirmed здесь, после успешного commit.
         return lesson
 
     async def cancel(self, lesson_id: UUID, reason: str | None = None) -> Lesson:
         lesson = await self._transition(lesson_id, LessonStatus.CANCELLED, reason)
-        # WP-06: публикация LessonCancelled здесь, после успешного commit.
         return lesson
 
     async def complete(self, lesson_id: UUID) -> Lesson:
@@ -197,8 +212,10 @@ class LessonService:
                     updated_at=now,
                 )
                 session.add(lesson)
+                event = events.rescheduled(original.id, lesson.id, old, draft, now)
                 await session.flush()
-            # WP-06: публикация LessonRescheduled здесь, вне write-транзакции.
+            if self.publisher is not None:
+                await self.publisher.publish(event)
             return lesson, report
 
     async def list_lessons(self, filters: LessonFilters) -> tuple[list[Lesson], int]:

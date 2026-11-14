@@ -54,7 +54,9 @@ LessonId = Annotated[UUID, Depends(lesson_id_from_path)]
 def get_lesson_service(context: Context) -> LessonService:
     if context.people_client is None:
         raise RuntimeError("people_client не подключён")
-    return LessonService(context.session_factory, context.people_client, context.clock)
+    return LessonService(
+        context.session_factory, context.people_client, context.clock, context.event_publisher
+    )
 
 
 Lessons = Annotated[LessonService, Depends(get_lesson_service)]

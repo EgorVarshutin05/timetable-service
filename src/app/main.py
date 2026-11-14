@@ -2,7 +2,7 @@
 
 Поднимает процесс с БД, часами, seed, чтением ресурсов и служебными эндпоинтами.
 Клиент people-stub закрывается вместе с ресурсами процесса.
-Зарегистрирована задача lesson-status-sweeper; издатель событий добавит WP-06.
+Зарегистрирован sweeper, брокер подключается лениво и закрывается вместе с процессом.
 """
 
 import asyncio
@@ -13,7 +13,7 @@ from contextlib import AsyncExitStack, asynccontextmanager
 from fastapi import FastAPI
 
 from app.api import groups, health, lessons, testing
-from app.broker import UnconfiguredBrokerProbe
+from app.broker import make_broker
 from app.clients.people import PeopleClient
 from app.clock import AdjustableClock
 from app.context import AppContext
@@ -30,13 +30,15 @@ log = logging.getLogger(__name__)
 def build_context(settings: Settings) -> AppContext:
     """Создать зависимости процесса (вне lifespan, чтобы тесты собирали контекст без сети)."""
     engine = make_engine(settings.database_url)
+    broker = make_broker(settings)
     context = AppContext(
         settings=settings,
         engine=engine,
         session_factory=make_session_factory(engine),
         clock=AdjustableClock(),
-        # ---> точка расширения: реальная проверка брокера (вместе с издателем событий).
-        broker_probe=UnconfiguredBrokerProbe(),
+        broker_probe=broker,
+        broker_client=broker,
+        event_publisher=broker,
         jobs=JobRegistry(),
         people_client=PeopleClient(settings),
     )
@@ -63,6 +65,8 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
 
     async with AsyncExitStack() as cleanup:
         cleanup.push_async_callback(context.engine.dispose)
+        if context.broker_client is not None:
+            cleanup.push_async_callback(context.broker_client.aclose)
         if context.people_client is not None:
             cleanup.push_async_callback(context.people_client.aclose)
         stop = asyncio.Event()

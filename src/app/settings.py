@@ -23,6 +23,15 @@ class Settings(BaseSettings):
         default="amqp://wa:wa@localhost:5672/",
         description="URL брокера: amqp://... для RabbitMQ, host:port для Kafka",
     )
+    rabbitmq_exchange: str = "wa.events"
+    kafka_topic: str = "wa.timetable.events"
+    broker_timeout_ms: int = Field(default=2000, ge=1)
+
+    @property
+    def rabbitmq_url(self) -> str:
+        """Каноническое имя env остаётся BROKER_URL, как в compose и e2e."""
+        return self.broker_url
+
     stub_base_url: str = Field(
         default="http://localhost:8100", description="Базовый URL заглушки соседнего сервиса"
     )

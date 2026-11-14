@@ -6,7 +6,7 @@ from dataclasses import dataclass, field
 from fastapi import Request
 from sqlalchemy.ext.asyncio import AsyncEngine, AsyncSession, async_sessionmaker
 
-from app.broker import BrokerProbe
+from app.broker import BrokerClient, BrokerProbe, EventPublisher
 from app.clients.people import PeopleClient
 from app.clock import AdjustableClock
 from app.jobs import JobRegistry
@@ -28,6 +28,8 @@ class AppContext:
     reset_state: Callable[[], Awaitable[None]] | None = None
     # В build_context всегда подключён; None допускается в изолированных API-тестах.
     people_client: PeopleClient | None = None
+    event_publisher: EventPublisher | None = None
+    broker_client: BrokerClient | None = None
 
 
 def get_context(request: Request) -> AppContext:
