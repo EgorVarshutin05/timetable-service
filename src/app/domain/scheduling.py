@@ -57,6 +57,15 @@ class InvalidLesson(Exception):
         self.issue = issue
 
 
+def ensure_editable(status: LessonStatus) -> None:
+    if status != LessonStatus.PLANNED:
+        raise InvalidLesson(
+            Issue(
+                "LESSON_NOT_EDITABLE", "Занятие нельзя изменить", {"current_status": status.value}
+            )
+        )
+
+
 def _invalid(field: str, message: str) -> InvalidLesson:
     return InvalidLesson(
         Issue("VALIDATION_ERROR", "Невалидные данные", {"fields": {field: message}})
