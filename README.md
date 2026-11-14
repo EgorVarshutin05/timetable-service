@@ -21,7 +21,20 @@ just setup       # шаблон коммита и хук проверки (CONTR
 curl -s localhost:8000/health/ready
 ```
 
-Брокер: RabbitMQ (по умолчанию в docker-compose.yml) — ...
+Выбрал RabbitMQ: он уже включён в compose по умолчанию, topic exchange и routing
+keys подходят трём событиям без дополнительных consumer groups и partitions.
+Для публикации включены publisher confirms; сообщения persistent, exchange durable.
+Приложение ставит aio-pika из runtime dependencies, а не рассчитывает на e2e-группу.
+Kafka также поддерживается адаптером и runtime-зависимостью aiokafka; переключение
+compose-профилей и адресов остаётся как в комментарии docker-compose.yml.
+
+Готовность по уточнению WP-06: 200
+`{"status":"ok","checks":{"database":"ok","broker":"ok"}}`.
+При отказе любой зависимости — 503 со status=degraded и отдельными checks.
+People-stub в readiness не входит. BROKER_URL — основной адрес; дополнительные
+RABBITMQ_EXCHANGE=wa.events, KAFKA_TOPIC=wa.timetable.events, BROKER_TIMEOUT_MS=2000
+совпадают в Settings, compose и .env.example. До первого ping/publish сеть к брокеру
+не открывается. /health/live остаётся независимым от зависимостей.
 
 ## Решения
 
@@ -205,13 +218,66 @@ return. В WP-06 здесь подключается publisher; отклонён
 публикацию после commit с окном сбоя между БД и брокером. Этот trade-off нужно
 учесть при реализации FR-13, не выдавая запись БД за доставку события.
 
+WP-06 (FR-13, NFR-01). domain/events.py формирует снимок события из чистого
+DraftLesson, не импортируя ORM/HTTP/брокер. Event_id — UUID v4, occurred_at — один
+Clock.now момента операции, все даты через to_iso_z. Семь полей конверта и payload
+проверяются по полным components.messages из неизменённого asyncapi.yaml, включая
+$ref и format checking. Idempotency_key относится к исходному lesson_id.
+В cancel previous_status снимается под row-lock до изменения. У reschedule
+корневой instructor_id — преподаватель исходного занятия, previous/new содержат
+свои instructor_id/classroom_id и даты, rescheduled_to_id — id нового занятия.
+
+Снимок строится внутри write-транзакции, publish вызывается после успешного выхода
+из session_scope. Изменение Clock между commit и отправкой не меняет occurred_at.
+При ошибке статуса/BR/flush/commit отправки нет. Create, validate, PATCH, complete,
+sweeper, seed и reset не публикуют событий. Независимая SQL-сессия в publisher-тесте
+уже видит оба committed результата переноса. Production build_context всегда
+подключает publisher; None допускается только прежними прямыми тест-конструкторами.
+
+RabbitBroker лениво открывает aio_pika connection/channel под asyncio.Lock,
+объявляет durable topic exchange wa.events и ждёт publisher confirms.
+Routing key — timetable.<EventType>, content_type=application/json,
+message_id=event_id, delivery_mode=2. Обязательных AMQP headers в AsyncAPI нет.
+mandatory=False означает, что отсутствие подписчиков не превращает переход в 500;
+это не обещает хранения без очереди. Потребитель должен заранее создать и привязать
+свою очередь. Исходный e2e делает именно это: e2e.timetable, exclusive/auto_delete,
+binding timetable.# до HTTP-запроса. Очередями потребителей publisher не управляет.
+
+При сетевом сбое/отмене соединение закрывается и сбрасывается; следующий запрос
+открывает его заново. Отправка не повторяется автоматически при неизвестном ack.
+Один lock упрощает ресурсную модель, но сериализует публикации процесса; пул
+каналов/очередь отправки пока избыточны. Rabbit ping — настоящий passive-declare RPC,
+а не локальный is_closed. Kafka отправляет в wa.timetable.events с acks=all,
+UTF-8 key исходного lesson_id и header event_type. Его probe выполняет describe_cluster
+через временный AdminClient без тестовых сообщений. Оба драйвера входят в runtime;
+uv.lock сохраняет все прежние имена/версии пакетов без upgrade.
+
+Один broker-объект выполняет роли publisher, probe и close. AsyncExitStack закрывает
+people-client, broker и engine при нормальном выходе и ошибке startup/seed/body.
+Проверки БД/брокера выполняются параллельно с прежними таймаутами health, независимо
+от people-stub. По явному уточнению запроса WP-06 заменил исходный плоский Readiness
+status/db/broker на status/checks.database/checks.broker и синхронизировал только
+эту схему/примеры openapi.yaml. Это несовместимое изменение относительно исходного
+TASK/OpenAPI; соответствующий commit и merge помечены !. AsyncAPI не изменён.
+
+Outbox не добавлен: TASK §3.4 разрешает публикацию после commit для Must. Ошибка
+publisher после commit возвращает стандартный 500 каркаса, но не откатывает БД
+и не переигрывает команду; повторный confirm получает 409. При потере acknowledgement
+брокер мог принять событие, хотя HTTP завершился ошибкой. Поэтому абсолютное правило
+«любой 5xx означает отсутствие события» без атомарной координации недостижимо.
+Тесты доказывают отсутствие отправки до commit, при rollback и достоверном отказе
+publisher. Не заявляю exactly-once или гарантированную доставку через crash gap;
+при усилении требований нужны outbox/retry и дедупликация у потребителя.
+
 ## Не сделано
 
-Текущий этап — WP-05. Создание, validate, список, PATCH, жизненный цикл и sweeper
-реализованы. Публичные функции E2E-01 и E2E-02 проходят целиком без изменения
-assertions на PostgreSQL + ASGI API. События и readiness брокера относятся к WP-06;
-до него readiness брокера остаётся degraded, полный E2E-17 не пройден.
-Внешний Docker/e2e-runner и OpenSpec CLI в окружении ассистента не запускались.
+Текущий этап — WP-06. Must-функции и публикация трёх событий реализованы;
+readiness использует настоящий RPC брокера. Исходные E2E-01/02 проходят целиком,
+E2E-17 — целиком с PostgreSQL + ASGI API и capture вместо сетевого брокера.
+Сетевой RabbitMQ/Kafka e2e и docker compose up --build в среде ассистента не
+запускались: Docker/серверы брокеров здесь отсутствуют. Runtime-only установка
+по флагам Dockerfile проверена отдельно. Outbox не реализован по границам Must.
+Финальная документация/архив OpenSpec — WP-07; Should/Could пока не реализованы.
 
 ## Async-кейс
 
@@ -337,6 +403,29 @@ row-lock, удвоение нагрузки переносимого занят�
 Реальный брокер и полный E2E-17 ожидают WP-06; Docker Compose здесь не запускался.
 Заголовки предложенных коммитов проверены на scopes и <=72 символов.
 
+WP-06: ChatGPT/Codex прочитал исходный архив через Python: AsyncAPI, TASK,
+broker/settings/health, Docker/compose и e2e helper/conftest/E2E-17. Добавлены
+runtime-зависимости без upgrade версий, адаптеры RabbitMQ/Kafka, post-commit events,
+схемные/транспортные тесты и наблюдение commit из независимой SQL-сессии.
+Сохранены все прежние решения/Async-замеры. В таблице факты 0,50 / 0,75 / 0,70 /
+0,83 / 0,6; WP-05=1,1 по последнему указанию п.4 запроса WP-06, которое расходилось
+с начальным 0,58. Факт WP-06 оставлен пустым.
+
+Отвергнуты публикация внутри транзакции, расчёт payload повторным чтением после
+commit, использование локального is_closed как readiness и зависимость runtime
+от e2e-группы. Исправлены сохранение previous_status под lock, тестовый импорт
+aio_pika для strict mypy и сброс повреждённого соединения после RPC-ошибки.
+Старые PostgreSQL-тесты используют явный capture, а не выключенный production broker.
+Только две старые readiness assertions обновлены под прямо запрошенную новую схему.
+
+Результат: ruff check/format и mypy --strict чисты (72 файла); PostgreSQL 16.2 —
+438 passed, без БД — 332 passed, 106 skipped. Новые тесты: 34 изолированных и 17
+PostgreSQL. Полная исходная функция E2E-17 выполняется без изменения assertions,
+сообщения дополнительно валидируются по AsyncAPI с проверкой форматов UUID/дат.
+Отдельная venv --locked --no-default-groups импортирует app.main/aio_pika/aiokafka
+при отсутствии pytest. Это не подменяет сетевой Docker/e2e прогон. Предлагаемые
+commit headers проверены настоящим lint_commits.py и ограничением <=72.
+
 ## Время
 
 | Пакет | Оценка задания, ч | Моя оценка до старта, ч | Факт, ч | Куда ушло время (при факте ≥ 2× и ≥ +1 ч) |
@@ -346,8 +435,8 @@ row-lock, удвоение нагрузки переносимого занят�
 | wp02-add-people-client | 0,75 | 0,75 | 0,70 | — |
 | wp03-detect-lesson-conflicts | 1,75 | 2,00 | 0,83 | — |
 | wp04-list-and-edit-lessons | 0,80 | 1,00 | 0,6 | — |
-| wp05-manage-lesson-lifecycle | 1,50 | 1,75 | 0,58 | |
-| wp06-publish-lesson-events | 0,70 | 0,75 | | |
+| wp05-manage-lesson-lifecycle | 1,50 | 1,75 | 0,58 | — |
+| wp06-publish-lesson-events | 0,70 | 0,75 | 0,50 | — |
 | wp07-finalize-docs | 0,40 | 0,50 | | |
 | Итого Must, включая WP-00 | 7,45 | 8,50 | | |
 | wp08-create-lesson-series | 1,00 | 1,25 | | |
