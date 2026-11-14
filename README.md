@@ -157,13 +157,61 @@ FOR SHARE и вызываю прежний assess с exclude_lesson_id и collec
 это не скрытый retry upstream-ошибок. При непрерывных изменениях возможны новые
 циклы, операция остаётся отменяемой. Новые миграции и зависимости не понадобились.
 
+WP-05 (FR-06..FR-10, BR-08). Статусная машина вынесена в domain/lifecycle.py:
+confirm только PLANNED → CONFIRMED, cancel и reschedule только из PLANNED или
+CONFIRMED, complete только IN_PROGRESS → COMPLETED. TRANSITION_FORBIDDEN содержит
+current_status/target_status. Для complete статус проверяется раньше BR-08:
+now >= ends_at, иначе LESSON_NOT_FINISHED с ends_at/now через to_iso_z.
+Cancel принимает отсутствие тела, {}, reason=null и строку до 500 символов;
+причина сохраняется в cancel_reason. Часы читаются только через Clock.
+
+Статусные команды используют SELECT FOR UPDATE и updated_at из одного now,
+сохраняя created_at и расписание. Они не вызывают people-stub. Advisory locks для
+confirm/cancel/complete не нужны: новые активные интервалы эти команды не добавляют.
+Они не запрашивают ресурсные locks после row-lock, поэтому не создают обратного
+порядка с PATCH/reschedule. При гонке confirm/cancel допустимы оба 200 (сначала
+confirm) или cancel=200 и confirm=409; конечное состояние всегда CANCELLED.
+
+Reschedule требует starts_at и ends_at, а непереданные instructor_id, format,
+classroom_id наследует. Явный classroom_id=null сохраняется через model_fields_set.
+Статус исходного проверяется до значений дат/UUID/enum и BR, до HTTP. Форма JSON
+и наличие обязательных полей проверяются при входе, как для PATCH в WP-04.
+В write-транзакции — sorted union old/new resource locks, затем FOR UPDATE и
+повторный статус, группа FOR SHARE, прежний assess(exclude_lesson_id=id,
+collect_all=False). Исключение применяется и к конфликтам, и к дневной нагрузке.
+Если PATCH изменил исходный DraftLesson во время HTTP, перенос освобождает locks
+и повторяет наследование/проверку по свежему снимку; updated_at версией не служит.
+
+Одна транзакция переводит исходное в RESCHEDULED и вставляет новое PLANNED с той же
+группой и rescheduled_from_id. Все новые timestamps и updated_at исходного равны
+одному Clock.now; исходный created_at сохраняется. Второй конкурентный перенос
+видит RESCHEDULED и получает 409. Unique/FK миграции WP-01 остаются последней
+защитой данных. Ошибка правил, flush или commit не оставляет половину переноса.
+Новые миграции и зависимости не требуются.
+
+lesson-status-sweeper зарегистрирован в build_context через существующий реестр.
+При TEST_MODE=1 его запускает POST /__test/jobs/lesson-status-sweeper/run,
+при TEST_MODE=0 — существующий периодический цикл. За один запуск now фиксируется
+один раз, все CONFIRMED с starts_at<=now выбираются ORDER BY id FOR UPDATE,
+переводятся в IN_PROGRESS и получают updated_at=now. ends_at не ограничивает
+выборку: уже закончившееся CONFIRMED также должно стартовать. Возвращаем processed
+после commit. От SKIP LOCKED отказался: он мог бы пропустить строку в ручном
+запуске; выбрано ожидание и повторная проверка WHERE PostgreSQL READ COMMITTED.
+Повторный и конкурентный sweeper не считают строку дважды.
+
+У confirm/cancel/reschedule выделена точка после выхода из session_scope, перед
+return. В WP-06 здесь подключается publisher; отклонённая операция/ошибка commit
+до этой точки не дойдёт. Сейчас событий нет. Outbox не добавлен: TASK допускает
+публикацию после commit с окном сбоя между БД и брокером. Этот trade-off нужно
+учесть при реализации FR-13, не выдавая запись БД за доставку события.
+
 ## Не сделано
 
-Текущий этап — WP-04. Создание, validate, список и PATCH реализованы.
-Публичные функции E2E-01 и E2E-02 проходят целиком без изменения assertions
-на PostgreSQL + ASGI API. Жизненный цикл, sweeper и события — следующие пакеты.
-Readiness брокера до WP-06 остаётся degraded. Внешний Docker/e2e-runner и
-OpenSpec CLI в окружении ассистента не запускались.
+Текущий этап — WP-05. Создание, validate, список, PATCH, жизненный цикл и sweeper
+реализованы. Публичные функции E2E-01 и E2E-02 проходят целиком без изменения
+assertions на PostgreSQL + ASGI API. События и readiness брокера относятся к WP-06;
+до него readiness брокера остаётся degraded, полный E2E-17 не пройден.
+Внешний Docker/e2e-runner и OpenSpec CLI в окружении ассистента не запускались.
 
 ## Async-кейс
 
@@ -270,6 +318,25 @@ query-модель, частичный PATCH, sorted union locks и PostgreSQL-�
 включая GET /lessons. Прежние замеры Async-кейса сохранены. Docker Compose
 здесь не запускался. Headers коммитов проверены на разрешённые scopes и <=72 символов.
 
+WP-05: ChatGPT/Codex прочитал исходные OpenAPI/TASK/jobs/testing/E2E-17 через
+Python и реализовал статусную машину, команды, атомарный перенос и sweeper поверх
+WP-04. Прежние решения и Async-замеры сохранены. По сообщению пользователя WP-04
+проверен, влит и запушен. Таблица сохраняет факты точно: WP-00=0,50; WP-01=0,75;
+WP-02=0,70; WP-03=0,83; WP-04=0,6. Факт WP-05 пока не заполнен.
+
+Отвергнуты вызов people-stub до проверки статуса, захват advisory locks после
+row-lock, удвоение нагрузки переносимого занятия, SKIP LOCKED для ручного sweeper
+и публикация внутри транзакции. При проверке исправлен тест BR-06: удлинённый
+исходный IN_PERSON пересекал другую seed-аудиторию; ONLINE-фикстура изолирует
+проверяемый инвариант. В тестах исправлена строгая типизация HTTPX kwargs.
+
+Проверки: ruff check/format и mypy --strict чисты; полный pytest на PostgreSQL
+16.2 — 387 passed, без БД — 298 passed, 89 skipped. Новые 107 изолированных и
+33 PostgreSQL-теста охватывают матрицу статусов, BR-08, приоритет ошибок, rollback,
+параллельные переносы/confirm-cancel/sweeper и изменение PATCH-снимка во время HTTP.
+Реальный брокер и полный E2E-17 ожидают WP-06; Docker Compose здесь не запускался.
+Заголовки предложенных коммитов проверены на scopes и <=72 символов.
+
 ## Время
 
 | Пакет | Оценка задания, ч | Моя оценка до старта, ч | Факт, ч | Куда ушло время (при факте ≥ 2× и ≥ +1 ч) |
@@ -278,8 +345,8 @@ query-модель, частичный PATCH, sorted union locks и PostgreSQL-�
 | wp01-load-seed-data | 0,80 | 1,00 | 0,75 | — |
 | wp02-add-people-client | 0,75 | 0,75 | 0,70 | — |
 | wp03-detect-lesson-conflicts | 1,75 | 2,00 | 0,83 | — |
-| wp04-list-and-edit-lessons | 0,80 | 1,00 | 0,6 | |
-| wp05-manage-lesson-lifecycle | 1,50 | 1,75 | | |
+| wp04-list-and-edit-lessons | 0,80 | 1,00 | 0,6 | — |
+| wp05-manage-lesson-lifecycle | 1,50 | 1,75 | 0,58 | |
 | wp06-publish-lesson-events | 0,70 | 0,75 | | |
 | wp07-finalize-docs | 0,40 | 0,50 | | |
 | Итого Must, включая WP-00 | 7,45 | 8,50 | | |

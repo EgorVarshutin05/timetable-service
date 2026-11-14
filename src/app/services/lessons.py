@@ -1,4 +1,4 @@
-"""FR-01/02: порядок проверок, транзакция и создание только после успешных правил."""
+"""Оркестрация расписания и жизненного цикла; успешный ответ только после commit."""
 
 from collections.abc import Callable
 from datetime import UTC
@@ -10,6 +10,7 @@ from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 from app.clock import Clock
 from app.db import session_scope
 from app.domain.lesson import LessonFormat, LessonStatus
+from app.domain.lifecycle import ensure_complete, ensure_transition
 from app.domain.listing import LessonFilters, validate_filters
 from app.domain.people import LessonPeople
 from app.domain.scheduling import (
@@ -63,6 +64,16 @@ def _validated(draft: DraftLesson) -> DraftLesson:
         raise _as_error(exc.issue, 422) from exc
 
 
+def _transitionable(lesson: Lesson | None, lesson_id: UUID, target: LessonStatus) -> Lesson:
+    if lesson is None:
+        raise not_found("Занятие не найдено", lesson_id=str(lesson_id))
+    try:
+        ensure_transition(lesson.status, target)
+    except InvalidLesson as exc:
+        raise _as_error(exc.issue, 409) from exc
+    return lesson
+
+
 async def assess(
     session: AsyncSession,
     draft: DraftLesson,
@@ -98,6 +109,97 @@ class LessonService:
         self, factory: async_sessionmaker[AsyncSession], people: PeopleSource, clock: Clock
     ) -> None:
         self.factory, self.people, self.clock = factory, people, clock
+
+    async def _transition(
+        self, lesson_id: UUID, target: LessonStatus, reason: str | None = None
+    ) -> Lesson:
+        async with session_scope(self.factory) as session:
+            lesson = _transitionable(
+                await scheduling.get_lesson(session, lesson_id, lock=True), lesson_id, target
+            )
+            now = self.clock.now().astimezone(UTC)
+            if target == LessonStatus.COMPLETED:
+                try:
+                    ensure_complete(lesson.status, lesson.ends_at, now)
+                except InvalidLesson as exc:
+                    raise _as_error(exc.issue, 409) from exc
+            lesson.status = target
+            lesson.updated_at = now
+            if target == LessonStatus.CANCELLED:
+                lesson.cancel_reason = reason
+            await session.flush()
+        return lesson
+
+    async def confirm(self, lesson_id: UUID) -> Lesson:
+        lesson = await self._transition(lesson_id, LessonStatus.CONFIRMED)
+        # WP-06: публикация LessonConfirmed здесь, после успешного commit.
+        return lesson
+
+    async def cancel(self, lesson_id: UUID, reason: str | None = None) -> Lesson:
+        lesson = await self._transition(lesson_id, LessonStatus.CANCELLED, reason)
+        # WP-06: публикация LessonCancelled здесь, после успешного commit.
+        return lesson
+
+    async def complete(self, lesson_id: UUID) -> Lesson:
+        return await self._transition(lesson_id, LessonStatus.COMPLETED)
+
+    async def reschedule(self, lesson_id: UUID, apply: DraftUpdate) -> tuple[Lesson, Assessment]:
+        while True:
+            async with self.factory() as session:
+                current = _transitionable(
+                    await scheduling.get_lesson(session, lesson_id),
+                    lesson_id,
+                    LessonStatus.RESCHEDULED,
+                )
+                old = scheduling.lesson_draft(current)
+            draft = _validated(apply(old))
+            people = await self.people.get_lesson_people(
+                instructor_id=draft.instructor_id,
+                lesson_format=draft.format,
+                classroom_id=draft.classroom_id,
+            )
+            async with session_scope(self.factory) as session:
+                await scheduling.lock_resources(session, old, draft)
+                original = _transitionable(
+                    await scheduling.get_lesson(session, lesson_id, lock=True),
+                    lesson_id,
+                    LessonStatus.RESCHEDULED,
+                )
+                if scheduling.lesson_draft(original) != old:
+                    # PATCH мог изменить ресурсы/наследуемые поля во время HTTP.
+                    continue
+                group = await scheduling.get_group(session, draft.group_id, lock=True)
+                if group is None:
+                    raise _group_missing(draft.group_id)
+                report = await assess(
+                    session,
+                    draft,
+                    group.size,
+                    people,
+                    exclude_lesson_id=lesson_id,
+                    collect_all=False,
+                )
+                now = self.clock.now().astimezone(UTC)
+                original.status = LessonStatus.RESCHEDULED
+                original.updated_at = now
+                lesson = Lesson(
+                    id=uuid4(),
+                    group_id=original.group_id,
+                    instructor_id=draft.instructor_id,
+                    classroom_id=draft.classroom_id,
+                    format=draft.format,
+                    starts_at=draft.starts_at,
+                    ends_at=draft.ends_at,
+                    status=LessonStatus.PLANNED,
+                    rescheduled_from_id=original.id,
+                    cancel_reason=None,
+                    created_at=now,
+                    updated_at=now,
+                )
+                session.add(lesson)
+                await session.flush()
+            # WP-06: публикация LessonRescheduled здесь, вне write-транзакции.
+            return lesson, report
 
     async def list_lessons(self, filters: LessonFilters) -> tuple[list[Lesson], int]:
         try:
