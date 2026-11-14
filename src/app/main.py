@@ -2,7 +2,7 @@
 
 Поднимает процесс с БД, часами, seed, чтением ресурсов и служебными эндпоинтами.
 Клиент people-stub закрывается вместе с ресурсами процесса.
-Издатель событий и предметные команды добавляются следующими пакетами.
+Зарегистрирована задача lesson-status-sweeper; издатель событий добавит WP-06.
 """
 
 import asyncio
@@ -21,6 +21,7 @@ from app.db import make_engine, make_session_factory
 from app.errors import install_error_handlers
 from app.jobs import JobRegistry, run_periodically
 from app.seed import load_seed, read_all, reset_data
+from app.services.lifecycle import sweep_lessons
 from app.settings import Settings, get_settings
 
 log = logging.getLogger(__name__)
@@ -40,8 +41,11 @@ def build_context(settings: Settings) -> AppContext:
         people_client=PeopleClient(settings),
     )
 
-    # ---> точка расширения: регистрация фоновых задач, например
-    # context.jobs.register("<job-name>", <корутина, возвращающая int>)
+    async def lesson_status_sweeper() -> int:
+        return await sweep_lessons(context.session_factory, context.clock)
+
+    context.jobs.register("lesson-status-sweeper", lesson_status_sweeper)
+
     async def reset_state() -> None:
         await reset_data(context.session_factory)
 
