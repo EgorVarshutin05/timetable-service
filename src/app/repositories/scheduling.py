@@ -29,12 +29,35 @@ def resource_lock_keys(draft: DraftLesson) -> tuple[int, ...]:
     )
 
 
-async def lock_resources(session: AsyncSession, draft: DraftLesson) -> None:
+async def lock_resources(
+    session: AsyncSession, draft: DraftLesson, *additional: DraftLesson
+) -> None:
     statement = text("SELECT pg_advisory_xact_lock(:key)").bindparams(
         bindparam("key", type_=BigInteger)
     )
-    for key in resource_lock_keys(draft):
+    keys = sorted({key for item in (draft, *additional) for key in resource_lock_keys(item)})
+    for key in keys:
         await session.execute(statement, {"key": key})
+
+
+async def get_lesson(
+    session: AsyncSession, lesson_id: UUID, *, lock: bool = False
+) -> Lesson | None:
+    statement = select(Lesson).where(Lesson.id == lesson_id)
+    if lock:
+        statement = statement.with_for_update().execution_options(populate_existing=True)
+    return (await session.scalars(statement)).one_or_none()
+
+
+def lesson_draft(lesson: Lesson) -> DraftLesson:
+    return DraftLesson(
+        lesson.group_id,
+        lesson.instructor_id,
+        lesson.classroom_id,
+        lesson.format,
+        lesson.starts_at,
+        lesson.ends_at,
+    )
 
 
 async def get_group(session: AsyncSession, group_id: UUID, *, lock: bool = False) -> Group | None:
