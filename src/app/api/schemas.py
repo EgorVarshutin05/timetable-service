@@ -130,6 +130,19 @@ class LessonPatch(BaseModel):
             raise ApiError(status, code, "Невалидные данные PATCH", details) from exc
 
 
+class RescheduleRequest(LessonPatch):
+    """Интервал обязателен; остальные поля наследуются, включая различение null."""
+
+    starts_at: str
+    ends_at: str
+
+
+class CancelRequest(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    reason: str | None = Field(default=None, max_length=500, strict=True)
+
+
 class LessonQuery(BaseModel):
     model_config = ConfigDict(extra="ignore")
 
