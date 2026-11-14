@@ -4,10 +4,14 @@ from collections.abc import AsyncIterator
 from typing import Annotated
 from uuid import UUID
 
-from fastapi import Depends
+from fastapi import Depends, Request
+from pydantic import ValidationError
 from sqlalchemy.ext.asyncio import AsyncSession
 
+from app.api.schemas import LessonQuery
 from app.context import AppContext, get_context
+from app.domain.listing import LessonFilters, validate_filters
+from app.domain.scheduling import InvalidLesson
 from app.errors import ApiError
 from app.services.lessons import LessonService
 
@@ -54,3 +58,22 @@ def get_lesson_service(context: Context) -> LessonService:
 
 
 Lessons = Annotated[LessonService, Depends(get_lesson_service)]
+
+
+def get_lesson_filters(request: Request) -> LessonFilters:
+    try:
+        query = LessonQuery.model_validate(dict(request.query_params))
+        return validate_filters(query.to_filters())
+    except ValidationError as exc:
+        fields = {
+            ".".join(str(part) for part in issue["loc"]): issue["msg"] for issue in exc.errors()
+        }
+        raise ApiError(
+            422, "VALIDATION_ERROR", "Невалидные параметры списка", {"fields": fields}
+        ) from exc
+    except InvalidLesson as exc:
+        issue = exc.issue
+        raise ApiError(422, issue.code, issue.message, issue.details) from exc
+
+
+Filters = Annotated[LessonFilters, Depends(get_lesson_filters)]
