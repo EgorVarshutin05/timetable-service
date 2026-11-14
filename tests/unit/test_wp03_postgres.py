@@ -22,6 +22,7 @@ from app.services.lessons import assess
 from app.settings import Settings
 from tests.e2e.public import test_e2e_01_create_lesson as public_create
 from tests.e2e.report import Recorder, ScenarioRecord
+from tests.unit.event_helpers import CapturingPublisher
 from tests.unit.scheduling_data import C1, C2, DRAFT, G1, G2, I1, I2, L1
 from tests.unit.test_lesson_commands_api import BODY, CONTRACT
 from tests.unit.test_people_client import CountingTransport
@@ -39,6 +40,7 @@ class RunningApp:
 async def running(database: Database, monkeypatch: pytest.MonkeyPatch) -> AsyncIterator[RunningApp]:
     monkeypatch.setattr(main, "make_engine", lambda _: database.engine)
     context = main.build_context(Settings(test_mode=True))
+    context.event_publisher = CapturingPublisher()
     assert context.people_client is not None
     await context.people_client.aclose()
     context.people_client = PeopleClient(Settings(), transport=CountingTransport(delay=0.001))
@@ -52,6 +54,8 @@ async def running(database: Database, monkeypatch: pytest.MonkeyPatch) -> AsyncI
             yield RunningApp(client, context)
     finally:
         await context.people_client.aclose()
+        if context.broker_client is not None:
+            await context.broker_client.aclose()
 
 
 async def lesson_count(database: Database) -> int:

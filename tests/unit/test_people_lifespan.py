@@ -67,7 +67,13 @@ async def test_readiness_does_not_call_people_stub() -> None:
             ) as client:
                 response = await client.get("/health/ready")
             assert response.status_code == 503
-            assert response.json() == {"status": "degraded", "db": "fail", "broker": "fail"}
+            assert response.json() == {
+                "status": "degraded",
+                "db": "fail",
+                "broker": "fail",
+            }
             assert calls == []
         finally:
+            if context.broker_client is not None:
+                await context.broker_client.aclose()
             await context.engine.dispose()
