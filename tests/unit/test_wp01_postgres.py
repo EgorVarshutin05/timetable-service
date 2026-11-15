@@ -144,7 +144,7 @@ async def test_reset_endpoint_restores_seed_and_preserves_clock(
         group = await client.get(f"/groups/{G1}")
         lesson = await client.get(f"/lessons/{L1}")
     assert group.json() == read_all()["groups"][0]
-    assert lesson.json() == read_all()["lessons"][0]
+    assert lesson.json() == read_all()["lessons"][0] | {"series_id": None}
     async with database.factory() as session:
         assert await session.scalar(select(func.count()).select_from(Group)) == 3
 
