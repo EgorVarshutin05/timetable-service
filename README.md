@@ -4,6 +4,7 @@
 редактирование и жизненный цикл. Стек: Python 3.12, FastAPI, SQLAlchemy 2 async,
 Alembic, PostgreSQL 16 и RabbitMQ. Контракты: `openapi.yaml`, `asyncapi.yaml`,
 `stubs/people-stub/stub-openapi.yaml`. Обязательная часть реализована пакетами WP-01..WP-07.
+WP-08 добавляет Should FR-14 — атомарные серии занятий.
 
 ## Запуск
 
@@ -83,7 +84,9 @@ just check
 Проверено при завершении WP-06: `just up`, readiness **200 OK** с исходным
 `status/db/broker`, затем `just e2e-public` — **3 passed in 9.14s**: E2E-01,
 E2E-02, E2E-17. Это реальный прогон автора на полном Docker-стеке.
-Полный unit/PostgreSQL-набор — **438 passed**. Статические проверки чисты.
+На этапе WP-08 полный unit/PostgreSQL-набор — **500 passed**. Статические проверки
+чисты; Docker-прогон FR-14 здесь не повторялся. При обновлении существующей БД
+entrypoint/`just migrate` применяет новую additive revision `0002`.
 
 ## Решения
 
@@ -168,9 +171,49 @@ Persistent message без bound queue может быть отброшен; оч
 
 **WP-07.** Канонические specs синхронизированы с текущей обязательной частью,
 WP-01..WP-06 перенесены в `openspec/changes/archive/2026-11-15-<id>`.
-Ветки и Change идентификаторы сохраняются. WP-07 архивируется после merge.
+Ветки и Change идентификаторы сохраняются. WP-07 также влит и архивирован.
 Нормативные HTTP/AsyncAPI контракты и исходный readiness сохранены. Пакет меняет
 документацию; искусственные feat/test-коммиты для него не создаются.
+
+**WP-08 (FR-14).** POST `/lesson-series` принимает count=1..50, duration_minutes=30..480,
+непустой уникальный список MON..SUN и first_starts_at со смещением. Сначала время
+переводится в UTC; weekday и повторения определяются по UTC-дате, а время суток UTC
+остаётся тем же. Если исходный день подходит, он включается, иначе выбирается
+следующий подходящий. Порядок weekdays во входном массиве не меняет хронологию.
+
+Чистый генератор проверяет BR-01/02 до БД/HTTP. Группа проверяется короткой сессией
+до единственного общего people lookup: 3 параллельных запроса для IN_PERSON и 2 для
+ONLINE. Это ограниченный batch, а не 50 повторных lookup по тем же ссылкам.
+Межэкземплярный assess идёт последовательно: важны первый индекс ошибки и нагрузка
+предыдущих занятий; один AsyncSession не используется конкурентно через gather.
+Так трактую фразу bounded concurrent validation из TASK §4 при общих ресурсах серии
+и явном требовании WP-08 проверять экземпляры по порядку.
+
+В одной write-транзакции захватывается sorted union advisory locks всей серии,
+группа читается FOR SHARE. Каждый экземпляр проходит прежний assess BR-04..07,
+вставляется и flush-ится, оставаясь незакоммиченным. Следующие SELECT видят его
+в той же транзакции, поэтому учитываются внутренние конфликты и BR-06 по локальным
+дням, включая вклад соседнего UTC-занятия через полночь. Warnings относятся к
+проверенному префиксу, задним числом предыдущие ответы не пересчитываются.
+Hard error возвращает исходные details и occurrence_index, начиная с 0; любой
+отказ откатывает все предыдущие INSERT. Общие reference/upstream ошибки получают
+index=0; структурные ошибки входного тела остаются обычными fields/errors.
+
+У всех новых занятий PLANNED, разные UUID v4 и общий series_id=UUID v4; один
+Clock.now задаёт created_at=updated_at всей серии. Возвращается 201
+`{series_id,items:[{lesson,warnings}]}` после commit. Создание серии событий не
+публикует. Проверки используют те же locks, что одиночный create/PATCH/reschedule.
+По текущему контракту одинаковое UTC-время и duration<=8h не дают двум экземплярам
+серии пересечься между собой, но прежний conflict алгоритм всё равно видит ранние
+вставки; дневная нагрузка может накапливаться на общей локальной дате.
+
+Миграция `0002` добавляет nullable UUID series_id и индекс, без отдельной таблицы
+или уникальности по series_id. У старых/одиночных/seed занятий JSON содержит null,
+что разрешено исходным OpenAPI. PATCH сохраняет membership; для reschedule выбрал
+наследование series_id новым преемником, поскольку перенос не меняет принадлежность.
+Этот случай отдельно не задан контрактом; решение покрыто PG-тестом. Downgrade
+удаляет только индекс/колонку: занятия сохраняются, membership теряется.
+Нормативные OpenAPI/AsyncAPI, 0001, readiness, broker и конфигурация не менялись.
 
 | Требования | Каноническая спецификация | Основная проверка |
 | --- | --- | --- |
@@ -180,6 +223,7 @@ WP-01..WP-06 перенесены в `openspec/changes/archive/2026-11-15-<id>`.
 | FR-03/05 | lesson-browsing-and-editing | list/PATCH, WP-04 PostgreSQL, E2E-02 |
 | FR-06..10, BR-08 | lesson-lifecycle | lifecycle matrix, WP-05 PostgreSQL |
 | FR-13, NFR-01 | lesson-events | events/transport, WP-06 PostgreSQL, E2E-17 |
+| FR-14 (Should) | lesson-series | UTC generator/API, WP-08 PostgreSQL и Alembic cycle |
 | NFR-01..07 | quality-and-delivery | static checks, Docker, README/OpenSpec/history |
 
 Спецификации лежат в `openspec/specs/<capability>/spec.md`; сценарии WHEN/THEN
@@ -188,20 +232,22 @@ WP-01..WP-06 перенесены в `openspec/changes/archive/2026-11-15-<id>`.
 ## Не сделано
 
 Вся обязательная часть **Must, WP-01..WP-07**, реализована и проверена:
-438 unit/API/PostgreSQL-тестов и 3 public E2E на полном Docker-стеке
-app + postgres + people-stub + rabbitmq, результат **3 passed in 9.14s**.
+Все 438 тестов Must сохраняются; вместе с WP-08 — 500 unit/API/PostgreSQL-тестов.
+При WP-06 автор проверил 3 public E2E на полном Docker-стеке
+app + postgres + people-stub + rabbitmq, **3 passed in 9.14s**.
+Should FR-14 (WP-08) реализован и проверен PostgreSQL/API-тестами; новый сетевой
+Docker-прогон серии в среде ассистента не выполнялся.
 
 В следующие пакеты выделены дополнительные требования:
 
 | Пакет | Приоритет | Содержание |
 | --- | --- | --- |
-| WP-08 | Should, FR-14 | Серия занятий, атомарное создание повторений |
 | WP-09 | Should, FR-15 | Нагрузка преподавателя за неделю |
 | WP-10 | Could, FR-16/17 | Список групп и TTL-кэш people-client |
 
 Не реализован необязательный transactional outbox. Сетевой Kafka-прогон не выполнялся:
-для сдачи выбран и проверен RabbitMQ. Факт WP-07 и итог Must автор впишет после
-завершения; слияние/архив WP-07 и финальный тег `submission` — завершающие действия.
+для сдачи выбран и проверен RabbitMQ. Факт WP-08 автор внесёт после завершения;
+итог Must 4,76 ч уже сохранён. Финальный тег `submission` — после выбранных пакетов.
 
 ## Async-кейс
 
@@ -262,6 +308,21 @@ scenarios и архивные Change пути. Из канона удалены 
 `just e2e-public` — **3 passed in 9.14s**. Эти сетевые результаты не приписываются
 ASGI/capture-тестам. Предыдущие пакеты влиты; реальные факты времени сохранены ниже.
 
+WP-08: ChatGPT/Codex прочитал исходные LessonSeriesCreate/Result/Lesson и TASK через
+Python, добавил чистый UTC-генератор, nullable membership, миграцию и транзакционный
+endpoint поверх WP-07. Отвергнуты commit на каждый экземпляр, дни недели в локальном
+offset, повторный people lookup на каждую дату и gather над одним AsyncSession.
+Два старых JSON-ожидания seed расширены только полем series_id=null; исходные e2e
+assertions и нормативные контракты не менялись. Все факты Must и сумма 4,76 сохранены.
+
+Результат WP-08: 51 новых изолированных и 11 PostgreSQL-тестов, полный прогон
+**500 passed** на PostgreSQL 16.2; без БД — 383 passed, 117 skipped. Ruff и strict
+mypy чисты (77 файлов). Проверены count/duration boundaries, UTC/leap dates,
+late conflict rollback index=2, cap index=0, BR-06 через полночь, две серии и
+single/series race, GET/membership/null и отсутствие create events. На отдельной
+БД прошли 0001 с данными → 0002 → 0001 → 0002, base → head и alembic check.
+Предлагаемые commit headers проверяются настоящим lint_commits.py, scopes и <=72.
+
 ## Время
 
 | Пакет | Оценка задания, ч | Моя оценка до старта, ч | Факт, ч | Куда ушло время (при факте ≥ 2× и ≥ +1 ч) |
@@ -275,7 +336,7 @@ ASGI/capture-тестам. Предыдущие пакеты влиты; реа�
 | wp06-publish-lesson-events | 0,70 | 0,75 | 0,50 | — |
 | wp07-finalize-docs | 0,40 | 0,50 | 0,30 | — |
 | Итого Must, включая WP-00 | 7,45 | 8,50 | 4,76 | — |
-| wp08-create-lesson-series | 1,00 | 1,25 | | |
+| wp08-create-lesson-series | 1,00 | 1,25 | 0,66 | |
 | wp09-report-instructor-workload | 0,50 | 0,75 | | |
 | wp10-list-groups-cache-people | 0,50 | 0,75 | | |
 | Итого Should/Could | 2,00 | 2,75 | | |

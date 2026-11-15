@@ -22,6 +22,7 @@ from app.clock import to_iso_z
 from app.domain.lesson import LessonFormat, LessonStatus
 from app.domain.listing import DEFAULT_LIMIT, MAX_LIMIT, LessonFilters
 from app.domain.scheduling import DraftLesson
+from app.domain.series import SeriesPlan, Weekday
 from app.errors import ApiError, classify_validation_error
 
 _OFFSET_DATETIME = re.compile(
@@ -143,6 +144,67 @@ class CancelRequest(BaseModel):
     reason: str | None = Field(default=None, max_length=500, strict=True)
 
 
+class LessonSeriesCreate(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    group_id: UUID
+    instructor_id: UUID
+    classroom_id: UUID | None = None
+    format: LessonFormat
+    weekdays: list[Weekday] = Field(min_length=1, json_schema_extra={"uniqueItems": True})
+    count: int = Field(ge=1, le=50, strict=True)
+    first_starts_at: AwareDatetime
+    duration_minutes: int = Field(ge=30, le=480, strict=True)
+
+    @field_validator("count", "duration_minutes", mode="before")
+    @classmethod
+    def require_json_integer(cls, value: object) -> int:
+        # JSON Schema считает 2 и 2.0 целыми; строки и boolean целыми не являются.
+        if type(value) is int:
+            return value
+        if isinstance(value, float) and value.is_integer():
+            return int(value)
+        raise PydanticCustomError("int_type", "Ожидается целое число JSON")
+
+    @field_validator("format", mode="before")
+    @classmethod
+    def require_format_string(cls, value: object) -> object:
+        return LessonCreate.require_format_string(value)
+
+    @field_validator("first_starts_at", mode="before")
+    @classmethod
+    def parse_first_datetime(cls, value: object) -> datetime:
+        return parse_iso_datetime(value)
+
+    @field_validator("weekdays", mode="before")
+    @classmethod
+    def require_weekday_strings(cls, value: object) -> object:
+        if not isinstance(value, list):
+            raise PydanticCustomError("list_type", "Ожидается массив дней недели")
+        if any(not isinstance(day, str) for day in value):
+            raise PydanticCustomError("string_type", "Дни недели должны быть строками")
+        return value
+
+    @field_validator("weekdays")
+    @classmethod
+    def unique_weekdays(cls, value: list[Weekday]) -> list[Weekday]:
+        if len(set(value)) != len(value):
+            raise ValueError("Дни недели не должны повторяться")
+        return value
+
+    def to_plan(self) -> SeriesPlan:
+        return SeriesPlan(
+            self.group_id,
+            self.instructor_id,
+            self.classroom_id,
+            self.format,
+            tuple(self.weekdays),
+            self.count,
+            self.first_starts_at,
+            self.duration_minutes,
+        )
+
+
 class LessonQuery(BaseModel):
     model_config = ConfigDict(extra="ignore")
 
@@ -202,6 +264,7 @@ class LessonResponse(BaseModel):
     status: LessonStatus
     rescheduled_from_id: UUID | None
     cancel_reason: str | None
+    series_id: UUID | None = None
     created_at: AwareDatetime
     updated_at: AwareDatetime
 
@@ -227,6 +290,11 @@ class ViolationResponse(IssueResponse):
 class LessonWithWarnings(BaseModel):
     lesson: LessonResponse
     warnings: list[WarningResponse]
+
+
+class LessonSeriesResult(BaseModel):
+    series_id: UUID
+    items: list[LessonWithWarnings]
 
 
 class LessonPage(BaseModel):

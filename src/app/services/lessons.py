@@ -28,6 +28,7 @@ from app.domain.scheduling import (
     workload_span,
     workload_warnings,
 )
+from app.domain.series import SeriesPlan, generate_series
 from app.errors import ApiError, not_found
 from app.models import Lesson
 from app.repositories import listing, scheduling
@@ -47,6 +48,12 @@ def _as_error(issue: Issue, status: int) -> ApiError:
 
 def _group_missing(group_id: UUID) -> ApiError:
     return ApiError(422, "GROUP_NOT_FOUND", "Группа не найдена", {"group_id": str(group_id)})
+
+
+def _at_occurrence(error: ApiError, index: int) -> ApiError:
+    return ApiError(
+        error.status_code, error.code, error.message, error.details | {"occurrence_index": index}
+    )
 
 
 def _editable(lesson: Lesson | None, lesson_id: UUID) -> Lesson:
@@ -117,6 +124,56 @@ class LessonService:
         self.factory, self.people, self.clock = factory, people, clock
         # None — только для прямых изолированных тестов прежних пакетов.
         self.publisher = publisher
+
+    async def create_series(self, plan: SeriesPlan) -> tuple[UUID, list[tuple[Lesson, Assessment]]]:
+        try:
+            drafts = generate_series(plan)
+        except InvalidLesson as exc:
+            raise _as_error(exc.issue, 422) from exc
+        async with self.factory() as session:
+            if await scheduling.get_group(session, plan.group_id) is None:
+                raise _at_occurrence(_group_missing(plan.group_id), 0)
+        try:
+            people = await self.people.get_lesson_people(
+                instructor_id=plan.instructor_id,
+                lesson_format=plan.format,
+                classroom_id=plan.classroom_id,
+            )
+        except ApiError as exc:
+            raise _at_occurrence(exc, 0) from exc
+        series_id = uuid4()
+        items: list[tuple[Lesson, Assessment]] = []
+        async with session_scope(self.factory) as session:
+            await scheduling.lock_resources(session, drafts[0], *drafts[1:])
+            group = await scheduling.get_group(session, plan.group_id, lock=True)
+            if group is None:
+                raise _at_occurrence(_group_missing(plan.group_id), 0)
+            now = self.clock.now().astimezone(UTC)
+            for index, draft in enumerate(drafts):
+                try:
+                    report = await assess(session, draft, group.size, people, collect_all=False)
+                except ApiError as exc:
+                    raise _at_occurrence(exc, index) from exc
+                lesson = Lesson(
+                    id=uuid4(),
+                    group_id=draft.group_id,
+                    instructor_id=draft.instructor_id,
+                    classroom_id=draft.classroom_id,
+                    format=draft.format,
+                    starts_at=draft.starts_at,
+                    ends_at=draft.ends_at,
+                    status=LessonStatus.PLANNED,
+                    rescheduled_from_id=None,
+                    cancel_reason=None,
+                    series_id=series_id,
+                    created_at=now,
+                    updated_at=now,
+                )
+                session.add(lesson)
+                # Следующий assess видит предыдущие INSERT этой же транзакции.
+                await session.flush()
+                items.append((lesson, report))
+        return series_id, items
 
     async def _transition(
         self, lesson_id: UUID, target: LessonStatus, reason: str | None = None
@@ -208,6 +265,7 @@ class LessonService:
                     status=LessonStatus.PLANNED,
                     rescheduled_from_id=original.id,
                     cancel_reason=None,
+                    series_id=original.series_id,
                     created_at=now,
                     updated_at=now,
                 )
@@ -302,6 +360,7 @@ class LessonService:
                     status=LessonStatus.PLANNED,
                     rescheduled_from_id=None,
                     cancel_reason=None,
+                    series_id=None,
                     created_at=now,
                     updated_at=now,
                 )

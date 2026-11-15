@@ -60,7 +60,7 @@ async def test_get_seed_lesson(
     response = await client.get(f"/lessons/{row['id']}")
     assert response.status_code == 200
     CONTRACT.assert_schema(response.json(), "Lesson")
-    assert response.json() == row
+    assert response.json() == row | {"series_id": None}
 
 
 @pytest.mark.parametrize("resource", ["groups", "lessons"])
