@@ -11,15 +11,12 @@ NFR-01 требует действительной готовности БД и 
 - Ленивые RabbitMQ/Kafka адаптеры, подтверждение публикации, RPC readiness и close.
 - aio-pika и aiokafka входят в runtime dependencies; версии lock не обновляются.
 - RabbitMQ остаётся выбранным брокером compose, его топология совпадает с e2e.
-- Readiness возвращает вложенный checks по явному уточнению пользователя WP-06.
+- Readiness сохраняет исходный плоский контракт status/db/broker.
 
-# Уточнения контракта
+# Контракт
 
-Исходные TASK/OpenAPI задавали status/db/broker. Пользователь WP-06 явно запросил
-status/checks.database/checks.broker. Применено последнее уточнение с синхронным
-изменением Readiness и examples в openapi.yaml; это несовместимое изменение,
-поэтому соответствующий commit и merge имеют ! и описание в README.
-AsyncAPI и публичные e2e assertions не меняются.
+Пользователь подтвердил исходные openapi.yaml и health.py без изменений.
+Readiness: status/db/broker. AsyncAPI и публичные e2e assertions не меняются.
 
 # Trade-offs
 
@@ -35,5 +32,5 @@ AsyncAPI и публичные e2e assertions не меняются.
 # Влияние
 
 domain/events — данные; broker — транспорт/health; services — граница commit;
-main/context/dependencies — DI и cleanup; health/OpenAPI — уточнённый response.
+main/context/dependencies — DI и cleanup; health — исходный response без изменения OpenAPI.
 Данные БД, lifecycle, conflict locks, Clock, people-client и seed не меняются.

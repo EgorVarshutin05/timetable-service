@@ -56,8 +56,8 @@ Kafka профиль compose по-прежнему требует переклю
 ошибки startup/seed и тела lifespan. Конструкторы не открывают сеть, поэтому
 изолированные тесты не требуют брокера. Production не подменяется no-op publisher.
 Health запускает БД и брокер через gather с отдельными таймаутами каркаса; people
-не участвует. Ответ по уточнению пользователя: status + checks.database/broker.
-Только Readiness в OpenAPI изменён; это явное исключение из исходного формата.
+не участвует. Ответ сохраняет исходный контракт: status/db/broker.
+openapi.yaml и src/app/api/health.py соответствуют исходному архиву.
 
 # Runtime и проверка
 
@@ -65,5 +65,5 @@ Health запускает БД и брокер через gather с отдель
 Отдельная venv с --locked --no-default-groups импортирует приложение/драйверы;
 pytest в ней отсутствует. Dockerfile менять не нужно. Тесты подтверждают AMQP
 properties, Kafka key/header, reconnect/close, схему всех трёх событий, commit
-в независимой SQL-сессии и исходный E2E-17 с capture. Внешний брокер/Docker
-не запускались и не подменяются в отчёте утверждением о сетевом e2e.
+в независимой SQL-сессии и исходный E2E-17 с capture. Пользователь дополнительно подтвердил Docker/RabbitMQ и сетевой e2e:
+3 passed in 9.14s, readiness=200; это отдельный прогон от ASGI/capture.

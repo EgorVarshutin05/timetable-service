@@ -64,15 +64,15 @@ The service SHALL import both supported broker drivers without dev/e2e groups.
 
 ### Requirement: Real broker readiness and resource lifecycle
 The service SHALL implement NFR-01 with concurrent database/broker probes and the
-user-requested nested checks response, keeping the people stub out of readiness.
+original flat status/db/broker response, keeping the people stub out of readiness.
 
 #### Scenario: Both dependencies available
 - **WHEN** database and broker RPC succeed
-- **THEN** 200 contains status=ok, checks.database=ok, checks.broker=ok.
+- **THEN** 200 contains status=ok, db=ok, broker=ok.
 
 #### Scenario: Dependency unavailable or timeout
 - **WHEN** either dependency fails or times out
-- **THEN** 503 contains status=degraded and each corresponding check status.
+- **THEN** 503 contains status=degraded and the top-level db and broker statuses.
 
 #### Scenario: Broker reconnect
 - **WHEN** an existing transport fails and a later request runs
