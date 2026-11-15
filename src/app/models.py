@@ -48,6 +48,7 @@ class Lesson(Base):
         Index("ix_lessons_classroom_interval", "classroom_id", "starts_at", "ends_at"),
         Index("ix_lessons_starts_id", "starts_at", "id"),
         Index("ix_lessons_status_starts_id", "status", "starts_at", "id"),
+        Index("ix_lessons_series_id", "series_id"),
     )
 
     id: Mapped[UUID] = mapped_column(Uuid, primary_key=True)
@@ -74,5 +75,6 @@ class Lesson(Base):
         ),
     )
     cancel_reason: Mapped[str | None] = mapped_column(Text)
+    series_id: Mapped[UUID | None] = mapped_column(Uuid)
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True))
     updated_at: Mapped[datetime] = mapped_column(DateTime(timezone=True))

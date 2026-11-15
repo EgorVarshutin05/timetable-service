@@ -55,6 +55,7 @@ class SeedLesson(BaseModel):
     status: LessonStatus
     rescheduled_from_id: UUID | None
     cancel_reason: str | None
+    series_id: UUID | None = None
     created_at: AwareDatetime
     updated_at: AwareDatetime
 
