@@ -14,6 +14,7 @@ from app.domain.listing import LessonFilters, validate_filters
 from app.domain.scheduling import InvalidLesson
 from app.errors import ApiError
 from app.services.lessons import LessonService
+from app.services.workload import WorkloadService
 
 Context = Annotated[AppContext, Depends(get_context)]
 
@@ -47,8 +48,13 @@ def lesson_id_from_path(lesson_id: str) -> UUID:
     return parse_resource_id(lesson_id, "lesson_id")
 
 
+def instructor_id_from_path(instructor_id: str) -> UUID:
+    return parse_resource_id(instructor_id, "instructor_id")
+
+
 GroupId = Annotated[UUID, Depends(group_id_from_path)]
 LessonId = Annotated[UUID, Depends(lesson_id_from_path)]
+InstructorId = Annotated[UUID, Depends(instructor_id_from_path)]
 
 
 def get_lesson_service(context: Context) -> LessonService:
@@ -60,6 +66,15 @@ def get_lesson_service(context: Context) -> LessonService:
 
 
 Lessons = Annotated[LessonService, Depends(get_lesson_service)]
+
+
+def get_workload_service(context: Context) -> WorkloadService:
+    if context.people_client is None:
+        raise RuntimeError("people_client не подключён")
+    return WorkloadService(context.session_factory, context.people_client)
+
+
+Workloads = Annotated[WorkloadService, Depends(get_workload_service)]
 
 
 def get_lesson_filters(request: Request) -> LessonFilters:
