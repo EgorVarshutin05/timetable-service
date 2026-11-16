@@ -236,7 +236,9 @@ async def gated_people(running: RunningApp, target: int) -> GateTransport:
     assert running.context.people_client is not None
     await running.context.people_client.aclose()
     transport = GateTransport(target)
-    running.context.people_client = PeopleClient(Settings(), transport=transport)
+    running.context.people_client = PeopleClient(
+        Settings(people_cache_ttl_seconds=0), transport=transport
+    )
     return transport
 
 
