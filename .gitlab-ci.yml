@@ -16,6 +16,14 @@ stages:
 
 check:
   stage: check
+  services:
+    - name: postgres:16-alpine
+      alias: postgres
+  variables:
+    POSTGRES_USER: wa
+    POSTGRES_PASSWORD: wa
+    POSTGRES_DB: wa_tests
+    WP01_TEST_DATABASE_URL: postgresql+asyncpg://wa:wa@postgres:5432/wa_tests
   before_script:
     - uv sync --locked
   script:
