@@ -50,6 +50,8 @@ def build_context(settings: Settings) -> AppContext:
 
     async def reset_state() -> None:
         await reset_data(context.session_factory)
+        if context.people_client is not None:
+            context.people_client.clear_cache()
 
     context.reset_state = reset_state
     return context

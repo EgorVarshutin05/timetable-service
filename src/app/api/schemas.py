@@ -243,12 +243,31 @@ def list_query_parameters() -> list[dict[str, Any]]:
     ]
 
 
+class GroupQuery(BaseModel):
+    model_config = ConfigDict(extra="ignore")
+
+    limit: int = Field(default=50, ge=1, le=200)
+    offset: int = Field(default=0, ge=0)
+
+
+def group_query_parameters() -> list[dict[str, Any]]:
+    return [
+        {"name": name, "in": "query", "required": False, "schema": value}
+        for name, value in GroupQuery.model_json_schema()["properties"].items()
+    ]
+
+
 class GroupResponse(BaseModel):
     model_config = ConfigDict(from_attributes=True)
 
     id: UUID
     name: str
     size: int = Field(ge=1)
+
+
+class GroupPage(BaseModel):
+    items: list[GroupResponse]
+    total: int = Field(ge=0)
 
 
 class LessonResponse(BaseModel):

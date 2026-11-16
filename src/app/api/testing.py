@@ -5,11 +5,13 @@
 подключить функцию очистки данных и повторного seed через ``AppContext.reset_state``.
 """
 
+from datetime import datetime
 from typing import Annotated
 
 from fastapi import APIRouter, Depends, Request, Response
-from pydantic import AwareDatetime, BaseModel, ConfigDict
+from pydantic import AwareDatetime, BaseModel, ConfigDict, field_validator
 
+from app.api.schemas import parse_iso_datetime
 from app.clock import to_iso_z
 from app.context import AppContext, get_context
 from app.errors import ApiError, not_found
@@ -35,6 +37,11 @@ class TestTime(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
     now: AwareDatetime
+
+    @field_validator("now", mode="before")
+    @classmethod
+    def parse_now(cls, value: object) -> datetime:
+        return parse_iso_datetime(value)
 
 
 class JobResult(BaseModel):

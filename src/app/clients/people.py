@@ -1,8 +1,10 @@
 """FR-12: параллельное чтение people-stub и перевод ошибок в формат платформы."""
 
 import asyncio
+from collections.abc import Callable
 from datetime import time
 from decimal import Decimal
+from time import monotonic
 from typing import Annotated, Literal, Self
 from uuid import UUID
 from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
@@ -10,6 +12,7 @@ from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 import httpx
 from pydantic import BaseModel, Field, StringConstraints, field_validator, model_validator
 
+from app.clients.cache import AsyncTTLCache
 from app.domain.lesson import LessonFormat
 from app.domain.people import (
     AvailabilityWindow,
@@ -78,7 +81,11 @@ class PeopleClient:
     """Владеет одним HTTPX-клиентом на lifespan; transport подменяется в тестах."""
 
     def __init__(
-        self, settings: Settings, *, transport: httpx.AsyncBaseTransport | None = None
+        self,
+        settings: Settings,
+        *,
+        transport: httpx.AsyncBaseTransport | None = None,
+        cache_timer: Callable[[], float] = monotonic,
     ) -> None:
         self._http = httpx.AsyncClient(
             base_url=settings.stub_base_url,
@@ -86,12 +93,23 @@ class PeopleClient:
             transport=transport,
             trust_env=False,
         )
+        ttl = settings.people_cache_ttl_seconds
+        self._profiles = AsyncTTLCache[InstructorProfile](ttl, cache_timer)
+        self._availability = AsyncTTLCache[InstructorAvailability](ttl, cache_timer)
+        self._classrooms = AsyncTTLCache[Classroom](ttl, cache_timer)
+
+    def clear_cache(self) -> None:
+        """Инвалидация всех типов; старые загрузки не заполнят новый generation."""
+        self._profiles.clear()
+        self._availability.clear()
+        self._classrooms.clear()
 
     @property
     def is_closed(self) -> bool:
         return self._http.is_closed
 
     async def aclose(self) -> None:
+        self.clear_cache()
         await self._http.aclose()
 
     async def __aenter__(self) -> Self:
@@ -139,6 +157,11 @@ class PeopleClient:
             raise self._unavailable(entity, entity_id) from exc
 
     async def get_instructor(self, instructor_id: UUID) -> InstructorProfile:
+        if self.is_closed:
+            raise RuntimeError("PeopleClient закрыт")
+        return await self._profiles.get(instructor_id, lambda: self._load_instructor(instructor_id))
+
+    async def _load_instructor(self, instructor_id: UUID) -> InstructorProfile:
         item = await self._fetch(
             f"instructors/{instructor_id}", "instructor", instructor_id, _Instructor
         )
@@ -147,6 +170,13 @@ class PeopleClient:
         return InstructorProfile(item.id, item.full_name, item.max_hours_per_day, item.timezone)
 
     async def get_availability(self, instructor_id: UUID) -> InstructorAvailability:
+        if self.is_closed:
+            raise RuntimeError("PeopleClient закрыт")
+        return await self._availability.get(
+            instructor_id, lambda: self._load_availability(instructor_id)
+        )
+
+    async def _load_availability(self, instructor_id: UUID) -> InstructorAvailability:
         item = await self._fetch(
             f"instructors/{instructor_id}/availability", "instructor", instructor_id, _Availability
         )
@@ -163,6 +193,11 @@ class PeopleClient:
         return InstructorAvailability(item.instructor_id, item.timezone, windows)
 
     async def get_classroom(self, classroom_id: UUID) -> Classroom:
+        if self.is_closed:
+            raise RuntimeError("PeopleClient закрыт")
+        return await self._classrooms.get(classroom_id, lambda: self._load_classroom(classroom_id))
+
+    async def _load_classroom(self, classroom_id: UUID) -> Classroom:
         item = await self._fetch(
             f"classrooms/{classroom_id}", "classroom", classroom_id, _Classroom
         )

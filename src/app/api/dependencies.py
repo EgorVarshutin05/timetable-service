@@ -8,7 +8,7 @@ from fastapi import Depends, Request
 from pydantic import ValidationError
 from sqlalchemy.ext.asyncio import AsyncSession
 
-from app.api.schemas import LessonQuery
+from app.api.schemas import GroupQuery, LessonQuery
 from app.context import AppContext, get_context
 from app.domain.listing import LessonFilters, validate_filters
 from app.domain.scheduling import InvalidLesson
@@ -94,3 +94,16 @@ def get_lesson_filters(request: Request) -> LessonFilters:
 
 
 Filters = Annotated[LessonFilters, Depends(get_lesson_filters)]
+
+
+def get_group_query(request: Request) -> GroupQuery:
+    try:
+        return GroupQuery.model_validate(dict(request.query_params))
+    except ValidationError as exc:
+        fields = {str(issue["loc"][0]): issue["msg"] for issue in exc.errors()}
+        raise ApiError(
+            422, "VALIDATION_ERROR", "Невалидная пагинация групп", {"fields": fields}
+        ) from exc
+
+
+GroupPagination = Annotated[GroupQuery, Depends(get_group_query)]
