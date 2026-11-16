@@ -4,7 +4,8 @@
 редактирование и жизненный цикл. Стек: Python 3.12, FastAPI, SQLAlchemy 2 async,
 Alembic, PostgreSQL 16 и RabbitMQ. Контракты: `openapi.yaml`, `asyncapi.yaml`,
 `stubs/people-stub/stub-openapi.yaml`. Обязательная часть реализована пакетами WP-01..WP-07.
-WP-08 добавляет Should FR-14 — атомарные серии занятий.
+WP-08 добавляет Should FR-14 — атомарные серии занятий; WP-09 — Should FR-15,
+нагрузку преподавателя за локальную ISO-неделю.
 
 ## Запуск
 
@@ -84,8 +85,9 @@ just check
 Проверено при завершении WP-06: `just up`, readiness **200 OK** с исходным
 `status/db/broker`, затем `just e2e-public` — **3 passed in 9.14s**: E2E-01,
 E2E-02, E2E-17. Это реальный прогон автора на полном Docker-стеке.
-На этапе WP-08 полный unit/PostgreSQL-набор — **500 passed**. Статические проверки
-чисты; Docker-прогон FR-14 здесь не повторялся. При обновлении существующей БД
+На этапе WP-09 полный unit/PostgreSQL-набор — **578 passed in 14.17s** на PostgreSQL
+16.2, ruff и strict mypy чисты (83 файла). Docker-прогон FR-14/15 здесь не повторялся.
+При обновлении существующей БД
 entrypoint/`just migrate` применяет новую additive revision `0002`.
 
 ## Решения
@@ -215,6 +217,29 @@ Clock.now задаёт created_at=updated_at всей серии. Возвращ
 удаляет только индекс/колонку: занятия сохраняются, membership теряется.
 Нормативные OpenAPI/AsyncAPI, 0001, readiness, broker и конфигурация не менялись.
 
+**WP-09 (FR-15).** GET `/instructors/{instructor_id}/workload?week=2026-W49`
+требует UUID пути и реально существующую ISO-неделю через `date.fromisocalendar`.
+Ошибки UUID дают 400 BAD_REQUEST, отсутствующая/невалидная week — 422
+VALIDATION_ERROR с fields.week; эти проверки выполняются до HTTP и SQL.
+Нужен только профиль преподавателя: availability и classroom не запрашиваются,
+поэтому отказ availability у I6 не мешает отчёту. Сервис переводит только профильный
+INSTRUCTOR_NOT_FOUND в 404 NOT_FOUND, поскольку преподаватель — ресурс пути.
+Общий people-client сохраняет BR-03 и 422 для ссылок тела; 502/504 не меняются.
+
+Границы недели — две независимо построенные локальные полуночи понедельников,
+переведённые в UTC. Нельзя прибавлять 168 UTC-часов: неделя DST может длиться
+167 или 169 часов. Один SELECT выбирает активные занятия преподавателя по строгому
+пересечению `starts_at < end AND ends_at > start`, включая COMPLETED и занятия
+серий. CANCELLED/RESCHEDULED исключены; касание границы не даёт часов.
+Чистый расчёт обрезает интервалы границами недели и вызывает ту же `daily_hours`,
+что BR-06. Возвращаются ровно 7 локальных дат, включая нули. Суммы и строгое
+`exceeded = hours > max_hours_per_day` считаются в Decimal до преобразования в float.
+
+Один SELECT даёт согласованный снимок строк PostgreSQL; write locks и commit
+отчёту не нужны. Профиль и БД не образуют распределённый снимок: используются
+профиль текущего запроса и затем снимок занятий. Clock, брокер и события не
+задействованы. Миграций и новых зависимостей нет; исходные контракты сохранены.
+
 | Требования | Каноническая спецификация | Основная проверка |
 | --- | --- | --- |
 | FR-04, FR-11, NFR-02/03 | catalog-bootstrap | catalog API, WP-01 PostgreSQL |
@@ -224,6 +249,7 @@ Clock.now задаёт created_at=updated_at всей серии. Возвращ
 | FR-06..10, BR-08 | lesson-lifecycle | lifecycle matrix, WP-05 PostgreSQL |
 | FR-13, NFR-01 | lesson-events | events/transport, WP-06 PostgreSQL, E2E-17 |
 | FR-14 (Should) | lesson-series | UTC generator/API, WP-08 PostgreSQL и Alembic cycle |
+| FR-15 (Should), BR-06 | instructor-workload | ISO-недели/DST, API и WP-09 PostgreSQL |
 | NFR-01..07 | quality-and-delivery | static checks, Docker, README/OpenSpec/history |
 
 Спецификации лежат в `openspec/specs/<capability>/spec.md`; сценарии WHEN/THEN
@@ -232,22 +258,21 @@ Clock.now задаёт created_at=updated_at всей серии. Возвращ
 ## Не сделано
 
 Вся обязательная часть **Must, WP-01..WP-07**, реализована и проверена:
-Все 438 тестов Must сохраняются; вместе с WP-08 — 500 unit/API/PostgreSQL-тестов.
+Все 438 тестов Must сохраняются; вместе с WP-08/09 — 578 unit/API/PostgreSQL-тестов.
 При WP-06 автор проверил 3 public E2E на полном Docker-стеке
 app + postgres + people-stub + rabbitmq, **3 passed in 9.14s**.
-Should FR-14 (WP-08) реализован и проверен PostgreSQL/API-тестами; новый сетевой
-Docker-прогон серии в среде ассистента не выполнялся.
+Should FR-14/15 (WP-08/09) реализованы и проверены PostgreSQL/API-тестами; новый
+сетевой Docker-прогон серии и отчёта в среде ассистента не выполнялся.
 
 В следующие пакеты выделены дополнительные требования:
 
 | Пакет | Приоритет | Содержание |
 | --- | --- | --- |
-| WP-09 | Should, FR-15 | Нагрузка преподавателя за неделю |
 | WP-10 | Could, FR-16/17 | Список групп и TTL-кэш people-client |
 
 Не реализован необязательный transactional outbox. Сетевой Kafka-прогон не выполнялся:
-для сдачи выбран и проверен RabbitMQ. Факт WP-08 автор внесёт после завершения;
-итог Must 4,76 ч уже сохранён. Финальный тег `submission` — после выбранных пакетов.
+для сдачи выбран и проверен RabbitMQ. Факт WP-08 — 0,75 ч, итог Must — 4,76 ч.
+Факт WP-09 автор внесёт после завершения. Финальный тег `submission` — после выбранных пакетов.
 
 ## Async-кейс
 
@@ -323,6 +348,21 @@ single/series race, GET/membership/null и отсутствие create events. �
 БД прошли 0001 с данными → 0002 → 0001 → 0002, base → head и alembic check.
 Предлагаемые commit headers проверяются настоящим lint_commits.py, scopes и <=72.
 
+WP-09: исходные FR-15 и Workload прочитаны через Python. Добавлены чистый парсер
+ISO-недели и отчёт на общей с BR-06 функции daily_hours, один SQL SELECT и один
+profile-only HTTP lookup. Отвергнуты группировка по UTC-дате, фиксированные 168 часов,
+семь отдельных SELECT, запрос availability и глобальная замена 422 на 404 в клиенте.
+Дневные суммы и exceeded вычисляются до float-сериализации. Старые тесты и код BR-06
+сохранены; нормативный readiness по-прежнему status/db/broker.
+
+Результат WP-09: 58 новых изолированных unit/API и 20 PostgreSQL-тестов;
+**578 passed in 14.17s** на PostgreSQL 16.2, без БД — 441 passed, 137 skipped.
+Ruff и strict mypy чисты (83 файла). Проверены 52/53 недели, ошибки до I/O,
+seed I1/2026-W49, все статусы, серия WP-08, локальная полночь и границы недели,
+весенний/осенний DST, равенство/превышение лимита, профиль I6 и 404/502/504.
+Публикаций нет. Новых миграций нет; Docker/e2e-прогон WP-09 не заявляется.
+Факты WP-00..WP-08 и Must 4,76 сохранены; факт WP-09 оставлен пустым.
+
 ## Время
 
 | Пакет | Оценка задания, ч | Моя оценка до старта, ч | Факт, ч | Куда ушло время (при факте ≥ 2× и ≥ +1 ч) |
@@ -336,8 +376,8 @@ single/series race, GET/membership/null и отсутствие create events. �
 | wp06-publish-lesson-events | 0,70 | 0,75 | 0,50 | — |
 | wp07-finalize-docs | 0,40 | 0,50 | 0,30 | — |
 | Итого Must, включая WP-00 | 7,45 | 8,50 | 4,76 | — |
-| wp08-create-lesson-series | 1,00 | 1,25 | 0,66 | |
-| wp09-report-instructor-workload | 0,50 | 0,75 | | |
+| wp08-create-lesson-series | 1,00 | 1,25 | 0,66 | — |
+| wp09-report-instructor-workload | 0,50 | 0,75 | 0,60 | — |
 | wp10-list-groups-cache-people | 0,50 | 0,75 | | |
 | Итого Should/Could | 2,00 | 2,75 | | |
 | Итого | 9,45 | 11,25 | | |
