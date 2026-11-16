@@ -42,6 +42,14 @@ current time. TEST_MODE SHALL expose time, reset and registered job endpoints.
 - **WHEN** TEST_MODE=0
 - **THEN** test endpoints return 404 and registered jobs run periodically.
 
+#### Scenario: Time input follows the HTTP contract
+- **WHEN** PUT /__test/time receives a number, boolean, null, object or array as now
+- **THEN** it returns 400 BAD_REQUEST without changing Clock.
+- **WHEN** now is a Unix timestamp string or another invalid datetime string
+- **THEN** it returns 422 VALIDATION_ERROR with details.fields.now, preserving Clock.
+- **WHEN** now is an ISO 8601 datetime string with an offset
+- **THEN** it freezes Clock at the corresponding UTC instant.
+
 ### Requirement: Uniform platform errors
 The service SHALL implement NFR-04 through errors.py with error.code, error.message
 and error.details. Syntactic JSON/type errors SHALL be 400; semantic rule errors,
@@ -62,6 +70,15 @@ mypy settings, isolated domain tests, API contract tests and PostgreSQL race tes
 #### Scenario: Quality gate
 - **WHEN** ruff check, ruff format --check, mypy --strict and pytest run
 - **THEN** static checks pass and the documented unit/PostgreSQL suite passes.
+
+#### Scenario: CI executes database tests
+- **WHEN** the GitHub Actions or GitLab check job runs
+- **THEN** PostgreSQL 16 is provided with WP01_TEST_DATABASE_URL set, so database
+  tests run in disposable schemas rather than being skipped for missing configuration.
+
+#### Scenario: Unit readiness does not depend on local services
+- **WHEN** the people-client readiness unit test runs with or without a local broker
+- **THEN** database and broker probes are fakes and no real integration is contacted.
 
 ### Requirement: Reviewable documentation and package history
 The repository SHALL implement NFR-06 with the six required README sections,
