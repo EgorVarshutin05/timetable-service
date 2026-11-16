@@ -1,13 +1,14 @@
 """Транзакционные блокировки и снимки кандидатов для BR-05/06."""
 
 import hashlib
+from collections.abc import Sequence
 from datetime import datetime
 from uuid import UUID
 
 from sqlalchemy import BigInteger, and_, bindparam, or_, select, text
 from sqlalchemy.ext.asyncio import AsyncSession
 
-from app.domain.scheduling import ACTIVE_STATUSES, DraftLesson, ScheduledLesson
+from app.domain.scheduling import ACTIVE_STATUSES, DraftLesson, ScheduledLesson, workload_span
 from app.models import Group, Lesson
 
 
@@ -93,6 +94,37 @@ async def get_candidates(
     if exclude_lesson_id is not None:
         statement = statement.where(Lesson.id != exclude_lesson_id)
     rows = (await session.scalars(statement.order_by(Lesson.id))).all()
+    return _snapshots(rows)
+
+
+async def get_series_candidates(
+    session: AsyncSession, drafts: tuple[DraftLesson, ...], timezone: str
+) -> list[ScheduledLesson]:
+    """Единый снимок BR-05/06 всей серии после захвата resource locks."""
+    first = drafts[0]
+    spans = [workload_span(draft, timezone) for draft in drafts]
+    resources = [Lesson.group_id == first.group_id]
+    if first.classroom_id is not None:
+        resources.append(Lesson.classroom_id == first.classroom_id)
+    statement = select(Lesson).where(
+        Lesson.status.in_(ACTIVE_STATUSES),
+        or_(
+            and_(
+                Lesson.starts_at < max(draft.ends_at for draft in drafts),
+                Lesson.ends_at > min(draft.starts_at for draft in drafts),
+                or_(*resources),
+            ),
+            and_(
+                Lesson.instructor_id == first.instructor_id,
+                Lesson.starts_at < max(end for _, end in spans),
+                Lesson.ends_at > min(start for start, _ in spans),
+            ),
+        ),
+    )
+    return _snapshots((await session.scalars(statement.order_by(Lesson.id))).all())
+
+
+def _snapshots(rows: Sequence[Lesson]) -> list[ScheduledLesson]:
     return [
         ScheduledLesson(
             row.id,

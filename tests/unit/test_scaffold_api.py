@@ -130,12 +130,42 @@ async def test_invalid_json_is_400(client: tuple[httpx.AsyncClient, AppContext])
     assert response.json()["error"]["code"] == "BAD_REQUEST"
 
 
-async def test_wrong_field_type_is_400(client: tuple[httpx.AsyncClient, AppContext]) -> None:
-    http, _ = client
-    # Число pydantic трактует как unix-время, поэтому «не тот тип» здесь — объект вместо строки.
-    response = await http.put("/__test/time", json={"now": {"year": 2026}})
+@pytest.mark.parametrize("value", [1796007600, 1796007600.5, True, None, {}, []])
+async def test_wrong_field_type_is_400(
+    client: tuple[httpx.AsyncClient, AppContext], value: object
+) -> None:
+    http, context = client
+    await http.put("/__test/time", json={"now": FROZEN})
+    before = context.clock.now()
+    response = await http.put("/__test/time", json={"now": value})
     assert response.status_code == 400
     assert response.json()["error"]["code"] == "BAD_REQUEST"
+    assert context.clock.now() == before
+
+
+@pytest.mark.parametrize("value", ["1796007600", "1796007600.5", "2026-11-30", "bad-time"])
+async def test_time_requires_iso_datetime_string(
+    client: tuple[httpx.AsyncClient, AppContext], value: str
+) -> None:
+    http, context = client
+    await http.put("/__test/time", json={"now": FROZEN})
+    before = context.clock.now()
+    response = await http.put("/__test/time", json={"now": value})
+    assert response.status_code == 422
+    error = response.json()["error"]
+    assert error["code"] == "VALIDATION_ERROR"
+    assert "now" in error["details"]["fields"]
+    assert context.clock.now() == before
+
+
+async def test_time_accepts_offset_and_normalizes_to_utc(
+    client: tuple[httpx.AsyncClient, AppContext],
+) -> None:
+    http, context = client
+    response = await http.put("/__test/time", json={"now": "2026-11-30T08:00:00+05:00"})
+    assert response.status_code == 200
+    assert response.json() == {"now": FROZEN}
+    assert context.clock.now() == datetime(2026, 11, 30, 3, tzinfo=UTC)
 
 
 async def test_jobs_run_registered_and_unknown(

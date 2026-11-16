@@ -57,6 +57,33 @@ class InvalidLesson(Exception):
         self.issue = issue
 
 
+def assess_snapshot(
+    draft: DraftLesson,
+    group_size: int,
+    people: LessonPeople,
+    existing: Iterable[ScheduledLesson],
+    exclude_lesson_id: UUID | None = None,
+    *,
+    collect_all: bool = True,
+) -> Assessment:
+    """BR-04..07 над готовым снимком; безопасно вызывать в независимых workers."""
+    existing = tuple(existing)
+    violations: list[Issue] = []
+    for issue in (
+        capacity_violation(draft, group_size, people),
+        conflict_violation(draft, existing, exclude_lesson_id),
+    ):
+        if issue is not None:
+            if not collect_all:
+                raise InvalidLesson(issue)
+            violations.append(issue)
+    warnings = list(workload_warnings(draft, existing, people, exclude_lesson_id))
+    unavailable = availability_warning(draft, people)
+    if unavailable is not None:
+        warnings.append(unavailable)
+    return Assessment(tuple(violations), tuple(warnings))
+
+
 def ensure_editable(status: LessonStatus) -> None:
     if status != LessonStatus.PLANNED:
         raise InvalidLesson(

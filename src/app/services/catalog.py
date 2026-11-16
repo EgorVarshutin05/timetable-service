@@ -9,6 +9,12 @@ from app.models import Group, Lesson
 from app.repositories import catalog
 
 
+async def list_groups(session: AsyncSession, limit: int, offset: int) -> tuple[list[Group], int]:
+    # Два SELECT видят один снимок даже при конкурентных INSERT/DELETE.
+    await session.connection(execution_options={"isolation_level": "REPEATABLE READ"})
+    return await catalog.get_groups_page(session, limit, offset)
+
+
 async def get_group(session: AsyncSession, group_id: UUID) -> Group:
     group = await catalog.get_group(session, group_id)
     if group is None:

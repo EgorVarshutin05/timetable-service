@@ -1,5 +1,6 @@
 """Оркестрация расписания и жизненного цикла; успешный ответ только после commit."""
 
+import asyncio
 from collections.abc import Callable
 from datetime import UTC
 from typing import Protocol
@@ -20,13 +21,12 @@ from app.domain.scheduling import (
     DraftLesson,
     InvalidLesson,
     Issue,
-    availability_warning,
+    ScheduledLesson,
+    assess_snapshot,
     capacity_violation,
-    conflict_violation,
     ensure_editable,
     validate_early,
     workload_span,
-    workload_warnings,
 )
 from app.domain.series import SeriesPlan, generate_series
 from app.errors import ApiError, not_found
@@ -34,6 +34,7 @@ from app.models import Lesson
 from app.repositories import listing, scheduling
 
 DraftUpdate = Callable[[DraftLesson], DraftLesson]
+SERIES_VALIDATION_CONCURRENCY = 4
 
 
 class PeopleSource(Protocol):
@@ -93,24 +94,65 @@ async def assess(
     collect_all: bool = True,
 ) -> Assessment:
     """Сессия уже держит resource locks; переиспользуется будущими PATCH/reschedule."""
-    violations: list[Issue] = []
     capacity = capacity_violation(draft, group_size, people)
-    if capacity is not None:
-        if not collect_all:
-            raise _as_error(capacity, 409)
-        violations.append(capacity)
+    if capacity is not None and not collect_all:
+        raise _as_error(capacity, 409)
     start, end = workload_span(draft, people.instructor.timezone)
     existing = await scheduling.get_candidates(session, draft, start, end, exclude_lesson_id)
-    conflict = conflict_violation(draft, existing, exclude_lesson_id)
-    if conflict is not None:
-        if not collect_all:
-            raise _as_error(conflict, 409)
-        violations.append(conflict)
-    warnings = list(workload_warnings(draft, existing, people, exclude_lesson_id))
-    unavailable = availability_warning(draft, people)
-    if unavailable is not None:
-        warnings.append(unavailable)
-    return Assessment(tuple(violations), tuple(warnings))
+    try:
+        return assess_snapshot(
+            draft, group_size, people, existing, exclude_lesson_id, collect_all=collect_all
+        )
+    except InvalidLesson as exc:
+        raise _as_error(exc.issue, 409) from exc
+
+
+async def assess_series(
+    drafts: tuple[DraftLesson, ...],
+    lesson_ids: tuple[UUID, ...],
+    group_size: int,
+    people: LessonPeople,
+    existing: tuple[ScheduledLesson, ...],
+) -> list[Assessment]:
+    """Независимые проверки снимков; максимум четыре worker, порядок ошибок по индексу."""
+    prefix = tuple(
+        ScheduledLesson(
+            lesson_id,
+            draft.group_id,
+            draft.instructor_id,
+            draft.classroom_id,
+            draft.starts_at,
+            draft.ends_at,
+            LessonStatus.PLANNED,
+        )
+        for lesson_id, draft in zip(lesson_ids, drafts, strict=True)
+    )
+    semaphore = asyncio.Semaphore(SERIES_VALIDATION_CONCURRENCY)
+
+    async def validate(index: int, draft: DraftLesson) -> Assessment:
+        async with semaphore:
+            return await asyncio.to_thread(
+                assess_snapshot,
+                draft,
+                group_size,
+                people,
+                existing + prefix[:index],
+                collect_all=False,
+            )
+
+    # Дожидаемся всех проверок: быстрый поздний отказ не скрывает более раннюю ошибку.
+    results = await asyncio.gather(
+        *(validate(index, draft) for index, draft in enumerate(drafts)),
+        return_exceptions=True,
+    )
+    reports: list[Assessment] = []
+    for index, result in enumerate(results):
+        if isinstance(result, InvalidLesson):
+            raise _at_occurrence(_as_error(result.issue, 409), index) from result
+        if isinstance(result, BaseException):
+            raise result
+        reports.append(result)
+    return reports
 
 
 class LessonService:
@@ -142,20 +184,21 @@ class LessonService:
         except ApiError as exc:
             raise _at_occurrence(exc, 0) from exc
         series_id = uuid4()
+        lesson_ids = tuple(uuid4() for _ in drafts)
         items: list[tuple[Lesson, Assessment]] = []
         async with session_scope(self.factory) as session:
             await scheduling.lock_resources(session, drafts[0], *drafts[1:])
             group = await scheduling.get_group(session, plan.group_id, lock=True)
             if group is None:
                 raise _at_occurrence(_group_missing(plan.group_id), 0)
+            existing = await scheduling.get_series_candidates(
+                session, drafts, people.instructor.timezone
+            )
+            reports = await assess_series(drafts, lesson_ids, group.size, people, tuple(existing))
             now = self.clock.now().astimezone(UTC)
-            for index, draft in enumerate(drafts):
-                try:
-                    report = await assess(session, draft, group.size, people, collect_all=False)
-                except ApiError as exc:
-                    raise _at_occurrence(exc, index) from exc
+            for lesson_id, draft, report in zip(lesson_ids, drafts, reports, strict=True):
                 lesson = Lesson(
-                    id=uuid4(),
+                    id=lesson_id,
                     group_id=draft.group_id,
                     instructor_id=draft.instructor_id,
                     classroom_id=draft.classroom_id,
@@ -170,9 +213,8 @@ class LessonService:
                     updated_at=now,
                 )
                 session.add(lesson)
-                # Следующий assess видит предыдущие INSERT этой же транзакции.
-                await session.flush()
                 items.append((lesson, report))
+            await session.flush()
         return series_id, items
 
     async def _transition(

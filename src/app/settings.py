@@ -36,6 +36,13 @@ class Settings(BaseSettings):
         default="http://localhost:8100", description="Базовый URL заглушки соседнего сервиса"
     )
     stub_timeout_ms: int = Field(default=2000, ge=1, description="Таймаут одного вызова заглушки")
+    people_cache_ttl_seconds: float = Field(
+        default=30,
+        ge=0,
+        le=3600,
+        allow_inf_nan=False,
+        description="TTL people-client в монотонных секундах; 0 отключает кэш",
+    )
     test_mode: bool = Field(
         default=False,
         description="TEST_MODE=1: доступны /__test/*, периодические задачи отключены",

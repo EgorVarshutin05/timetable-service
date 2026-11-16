@@ -1,10 +1,12 @@
 """FR-14: чистая UTC-генерация, ранние ошибки и API без сети/БД."""
 
+import asyncio
 from dataclasses import replace
 from datetime import UTC, datetime, timedelta
+from threading import Event, Lock
 from typing import Any
 from unittest.mock import AsyncMock, MagicMock
-from uuid import UUID
+from uuid import UUID, uuid4
 
 import httpx
 import pytest
@@ -12,7 +14,14 @@ from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.clock import AdjustableClock
 from app.domain.lesson import LessonFormat, LessonStatus
-from app.domain.scheduling import Assessment, InvalidLesson, ScheduledLesson, workload_warnings
+from app.domain.scheduling import (
+    Assessment,
+    DraftLesson,
+    InvalidLesson,
+    Issue,
+    ScheduledLesson,
+    workload_warnings,
+)
 from app.domain.series import SeriesPlan, Weekday, generate_series
 from app.errors import ApiError
 from app.models import Group, Lesson
@@ -208,7 +217,7 @@ async def test_group_absence_precedes_upstream(
 @pytest.fixture
 async def series_client(
     command_client: tuple[httpx.AsyncClient, MagicMock, AsyncMock], monkeypatch: pytest.MonkeyPatch
-) -> tuple[httpx.AsyncClient, AsyncMock, AsyncMock, AsyncMock]:
+) -> tuple[httpx.AsyncClient, AsyncMock, AsyncMock, MagicMock]:
     client, factory, people = command_client
     session = AsyncMock(spec=AsyncSession)
     factory.return_value.__aenter__.return_value = session
@@ -216,15 +225,16 @@ async def series_client(
         scheduling, "get_group", AsyncMock(return_value=Group(id=G1, name="G", size=12))
     )
     monkeypatch.setattr(scheduling, "lock_resources", AsyncMock())
-    assess = AsyncMock(return_value=Assessment((), ()))
-    monkeypatch.setattr(lessons, "assess", assess)
+    monkeypatch.setattr(scheduling, "get_series_candidates", AsyncMock(return_value=[]))
+    assess = MagicMock(return_value=Assessment((), ()))
+    monkeypatch.setattr(lessons, "assess_snapshot", assess)
     people.get_lesson_people.return_value = PEOPLE
     monkeypatch.setattr(AdjustableClock, "now", lambda _: datetime(2026, 11, 30, 3, tzinfo=UTC))
     return client, session, people, assess
 
 
 async def test_series_api_success_and_single_people_lookup(
-    series_client: tuple[httpx.AsyncClient, AsyncMock, AsyncMock, AsyncMock],
+    series_client: tuple[httpx.AsyncClient, AsyncMock, AsyncMock, MagicMock],
 ) -> None:
     client, session, people, assess = series_client
     response = await client.post("/lesson-series", json=BODY)
@@ -238,14 +248,14 @@ async def test_series_api_success_and_single_people_lookup(
     assert all(item["lesson"]["status"] == "PLANNED" for item in result["items"])
     assert all(item["lesson"]["created_at"] == "2026-11-30T03:00:00Z" for item in result["items"])
     people.get_lesson_people.assert_awaited_once()
-    assert assess.await_count == 3
-    assert session.flush.await_count == 3
+    assert assess.call_count == 3
+    session.flush.assert_awaited_once()
     session.commit.assert_awaited_once()
 
 
 @pytest.mark.parametrize("changes", [{"count": 2.0}, {"duration_minutes": 30.0}])
 async def test_json_schema_integral_numbers_are_accepted(
-    series_client: tuple[httpx.AsyncClient, AsyncMock, AsyncMock, AsyncMock],
+    series_client: tuple[httpx.AsyncClient, AsyncMock, AsyncMock, MagicMock],
     changes: dict[str, float],
 ) -> None:
     client, _, _, _ = series_client
@@ -263,16 +273,23 @@ async def test_json_schema_integral_numbers_are_accepted(
     ],
 )
 async def test_first_hard_violation_adds_index_and_rolls_back(
-    series_client: tuple[httpx.AsyncClient, AsyncMock, AsyncMock, AsyncMock],
+    series_client: tuple[httpx.AsyncClient, AsyncMock, AsyncMock, MagicMock],
     index: int,
     code: str,
     details: dict[str, Any],
 ) -> None:
     client, session, _, assess = series_client
-    assess.side_effect = [Assessment((), ())] * index + [ApiError(409, code, "Нарушение", details)]
+    failing_start = generate_series(PLAN)[index].starts_at
+
+    def check(draft: DraftLesson, *args: object, **kwargs: object) -> Assessment:
+        if draft.starts_at == failing_start:
+            raise InvalidLesson(Issue(code, "Нарушение", details))
+        return Assessment((), ())
+
+    assess.side_effect = check
     response = await client.post("/lesson-series", json=BODY)
     assert CONTRACT.assert_error(response, 409, code) == details | {"occurrence_index": index}
-    assert session.flush.await_count == index
+    session.flush.assert_not_awaited()
     session.commit.assert_not_awaited()
     session.rollback.assert_awaited_once()
 
@@ -287,11 +304,73 @@ async def test_first_hard_violation_adds_index_and_rolls_back(
     ],
 )
 async def test_series_preserves_upstream_errors(
-    series_client: tuple[httpx.AsyncClient, AsyncMock, AsyncMock, AsyncMock], status: int, code: str
+    series_client: tuple[httpx.AsyncClient, AsyncMock, AsyncMock, MagicMock], status: int, code: str
 ) -> None:
     client, session, people, assess = series_client
     people.get_lesson_people.side_effect = ApiError(status, code, "Upstream failed")
     response = await client.post("/lesson-series", json=BODY)
     assert CONTRACT.assert_error(response, status, code)["occurrence_index"] == 0
-    assess.assert_not_awaited()
+    assess.assert_not_called()
     session.commit.assert_not_awaited()
+
+
+async def test_occurrence_checks_run_concurrently_with_a_fixed_bound(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    drafts = generate_series(replace(PLAN, count=12))
+    full, release, mutex = Event(), Event(), Lock()
+    active = started = peak = 0
+
+    def check(*args: object, **kwargs: object) -> Assessment:
+        nonlocal active, started, peak
+        with mutex:
+            active += 1
+            started += 1
+            peak = max(peak, active)
+            if active == lessons.SERIES_VALIDATION_CONCURRENCY:
+                full.set()
+        try:
+            assert release.wait(5), "Worker release timed out"
+            return Assessment((), ())
+        finally:
+            with mutex:
+                active -= 1
+
+    monkeypatch.setattr(lessons, "assess_snapshot", check)
+    async with asyncio.timeout(8), asyncio.TaskGroup() as tasks:
+        task = tasks.create_task(
+            lessons.assess_series(drafts, tuple(uuid4() for _ in drafts), 12, PEOPLE, ())
+        )
+        try:
+            assert await asyncio.to_thread(full.wait, 3), "Checks did not run concurrently"
+            with mutex:
+                assert started == active == peak == lessons.SERIES_VALIDATION_CONCURRENCY
+        finally:
+            release.set()
+    reports = task.result()
+    assert len(reports) == len(drafts)
+    assert started == 12
+    assert active == 0
+    assert peak == lessons.SERIES_VALIDATION_CONCURRENCY
+
+
+async def test_first_error_uses_index_instead_of_worker_completion_order(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    drafts = generate_series(PLAN)
+    later_failed = Event()
+
+    def check(draft: DraftLesson, *args: object, **kwargs: object) -> Assessment:
+        if draft.starts_at == drafts[1].starts_at:
+            assert later_failed.wait(3)
+            raise InvalidLesson(Issue("CLASSROOM_TOO_SMALL", "Earlier error", {"capacity": 10}))
+        if draft.starts_at == drafts[2].starts_at:
+            later_failed.set()
+            raise InvalidLesson(Issue("SCHEDULE_CONFLICT", "Later error", {}))
+        return Assessment((), ())
+
+    monkeypatch.setattr(lessons, "assess_snapshot", check)
+    with pytest.raises(ApiError) as error:
+        await lessons.assess_series(drafts, tuple(uuid4() for _ in drafts), 12, PEOPLE, ())
+    assert error.value.code == "CLASSROOM_TOO_SMALL"
+    assert error.value.details == {"capacity": 10, "occurrence_index": 1}

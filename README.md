@@ -6,6 +6,7 @@ Alembic, PostgreSQL 16 и RabbitMQ. Контракты: `openapi.yaml`, `asyncap
 `stubs/people-stub/stub-openapi.yaml`. Обязательная часть реализована пакетами WP-01..WP-07.
 WP-08 добавляет Should FR-14 — атомарные серии занятий; WP-09 — Should FR-15,
 нагрузку преподавателя за локальную ISO-неделю.
+WP-10 завершает Could FR-16/17 — список групп и TTL-кэш people-client.
 
 ## Запуск
 
@@ -47,6 +48,8 @@ People-stub в readiness не входит. `/health/live` остаётся 200,
 `STUB_TIMEOUT_MS`, `TEST_MODE`, `SEED_ON_START`, `JOBS_INTERVAL_SECONDS`, `LOG_LEVEL`.
 Дополнительные defaults: `RABBITMQ_EXCHANGE=wa.events`,
 `KAFKA_TOPIC=wa.timetable.events`, `BROKER_TIMEOUT_MS=2000`.
+`PEOPLE_CACHE_TTL_SECONDS=30` задаёт TTL people-client (0 отключает, максимум 3600).
+Настройка передаётся в app через compose; новые зависимости не требуются.
 `settings.rabbitmq_url` читает канонический `BROKER_URL`. Kafka-адаптер также есть;
 для него переключаются defaults и профили по инструкции в `docker-compose.yml`.
 Основной и проверенный сетевым e2e брокер — RabbitMQ.
@@ -54,7 +57,8 @@ People-stub в readiness не входит. `/health/live` остаётся 200,
 По умолчанию compose использует `TEST_MODE=1`: доступны `/__test/time`,
 `/__test/reset` и ручной запуск `lesson-status-sweeper`, периодический цикл отключён.
 `POST /__test/reset` удаляет текущие группы/занятия и восстанавливает seed, не меняя
-Clock. При `TEST_MODE=0` тестовые маршруты возвращают 404, а job запускается каждые
+Clock; после успешного reset очищается также кэш people-client. При `TEST_MODE=0`
+тестовые маршруты возвращают 404, а job запускается каждые
 `JOBS_INTERVAL_SECONDS` (по умолчанию 30, допустимо 1..60).
 
 Проверки с хоста:
@@ -85,8 +89,9 @@ just check
 Проверено при завершении WP-06: `just up`, readiness **200 OK** с исходным
 `status/db/broker`, затем `just e2e-public` — **3 passed in 9.14s**: E2E-01,
 E2E-02, E2E-17. Это реальный прогон автора на полном Docker-стеке.
-На этапе WP-09 полный unit/PostgreSQL-набор — **578 passed in 14.17s** на PostgreSQL
-16.2, ruff и strict mypy чисты (83 файла). Docker-прогон FR-14/15 здесь не повторялся.
+На этапе WP-10 полный unit/PostgreSQL-набор — **635 passed in 14.31s** на PostgreSQL
+16.2, ruff и strict mypy чисты (87 файлов). Это исходный замер WP-10;
+результаты последующего Docker-аудита приведены в «Не сделано» и «AI notes».
 При обновлении существующей БД
 entrypoint/`just migrate` применяет новую additive revision `0002`.
 
@@ -185,20 +190,24 @@ WP-01..WP-06 перенесены в `openspec/changes/archive/2026-11-15-<id>`.
 
 Чистый генератор проверяет BR-01/02 до БД/HTTP. Группа проверяется короткой сессией
 до единственного общего people lookup: 3 параллельных запроса для IN_PERSON и 2 для
-ONLINE. Это ограниченный batch, а не 50 повторных lookup по тем же ссылкам.
-Межэкземплярный assess идёт последовательно: важны первый индекс ошибки и нагрузка
-предыдущих занятий; один AsyncSession не используется конкурентно через gather.
-Так трактую фразу bounded concurrent validation из TASK §4 при общих ресурсах серии
-и явном требовании WP-08 проверять экземпляры по порядку.
+ONLINE. В write-транзакции захватывается sorted union advisory locks всей серии,
+группа читается FOR SHARE, а один SELECT загружает снимок активных занятий для
+BR-05/06. Межэкземплярные проверки BR-04..07 выполняются конкурентно через
+asyncio.to_thread с Semaphore(4): одновременно работают не более четырёх проверок.
+Workers получают immutable domain snapshots; ORM и AsyncSession остаются в event loop.
 
-В одной write-транзакции захватывается sorted union advisory locks всей серии,
-группа читается FOR SHARE. Каждый экземпляр проходит прежний assess BR-04..07,
-вставляется и flush-ится, оставаясь незакоммиченным. Следующие SELECT видят его
-в той же транзакции, поэтому учитываются внутренние конфликты и BR-06 по локальным
-дням, включая вклад соседнего UTC-занятия через полночь. Warnings относятся к
-проверенному префиксу, задним числом предыдущие ответы не пересчитываются.
+Каждая проверка видит общий снимок БД и префикс ранее сгенерированных занятий с
+заранее выделенными UUID. Поэтому сохраняются внутрисерийные конфликты и BR-06
+через локальную полночь; предупреждения относятся к проверяемому префиксу.
+Сервис дожидается всех проверок и выбирает первую ошибку по индексу экземпляра,
+независимо от порядка завершения workers. Только после успеха всей серии идут
+INSERT/flush и единый commit. Resource locks удерживаются от чтения снимка до
+commit, поэтому одиночный create/PATCH/reschedule и другие серии не обходят BR-05.
+Пул потоков использует стандартный executor asyncio; отдельного процесса нет.
+Это конкурентная обработка, а не обещание CPU-ускорения Python-кода под GIL.
+
 Hard error возвращает исходные details и occurrence_index, начиная с 0; любой
-отказ откатывает все предыдущие INSERT. Общие reference/upstream ошибки получают
+отказ не допускает INSERT серии. Общие reference/upstream ошибки получают
 index=0; структурные ошибки входного тела остаются обычными fields/errors.
 
 У всех новых занятий PLANNED, разные UUID v4 и общий series_id=UUID v4; один
@@ -206,8 +215,8 @@ Clock.now задаёт created_at=updated_at всей серии. Возвращ
 `{series_id,items:[{lesson,warnings}]}` после commit. Создание серии событий не
 публикует. Проверки используют те же locks, что одиночный create/PATCH/reschedule.
 По текущему контракту одинаковое UTC-время и duration<=8h не дают двум экземплярам
-серии пересечься между собой, но прежний conflict алгоритм всё равно видит ранние
-вставки; дневная нагрузка может накапливаться на общей локальной дате.
+серии пересечься между собой, но прежний conflict алгоритм всё равно видит
+предыдущие сгенерированные экземпляры; дневная нагрузка может накапливаться на общей локальной дате.
 
 Миграция `0002` добавляет nullable UUID series_id и индекс, без отдельной таблицы
 или уникальности по series_id. У старых/одиночных/seed занятий JSON содержит null,
@@ -240,6 +249,46 @@ INSTRUCTOR_NOT_FOUND в 404 NOT_FOUND, поскольку преподавате
 профиль текущего запроса и затем снимок занятий. Clock, брокер и события не
 задействованы. Миграций и новых зависимостей нет; исходные контракты сохранены.
 
+**WP-10 (FR-16).** GET `/groups` возвращает `{items,total}`, limit=50 (1..200),
+offset=0 (>=0). SQL сортирует всю выборку по `name ASC, id ASC` до LIMIT/OFFSET;
+используется collation PostgreSQL. Имена-дубликаты разрешены, UUID задаёт устойчивый
+порядок. Offset за концом даёт пустые items и полный total. Пагинация валидируется
+до SQL и даёт 422 VALIDATION_ERROR с fields, включая нецелые query values.
+COUNT и page SELECT читаются в одной REPEATABLE READ транзакции без commit/записей.
+GET группы по ID сохраняется без изменений; I/O people-stub/брокера здесь нет.
+
+**WP-10 (FR-17).** Три типизированных TTL/LRU-кэша на PeopleClient хранят только
+успешные валидированные immutable domain values: профиль, окна и аудиторию.
+Ключ — UUID внутри типа; разные клиенты/workers не делят значения. TTL по умолчанию
+30 секунд, `PEOPLE_CACHE_TTL_SECONDS=0` отключает хранение и объединение запросов.
+Диапазон настройки 0..3600, NaN/Infinity отклоняются. Срок измеряется монотонным
+таймером **от успешного завершения загрузки**, действует строго до deadline.
+Clock отвечает за предметное время; его freeze/reset не управляет TTL.
+На тип хранится максимум 256 LRU values (768 на клиент); истёкшие записи удаляются
+при обращениях. Ошибки 404/5xx/сеть/таймаут/некорректный payload и отмена не кэшируются.
+Expired value не используется как fallback при отказе upstream.
+
+Метаданные защищены коротким RLock, HTTP никогда не выполняется под этим mutex.
+Async lock на ключ объединяет одновременные успешные miss. Разные UUID и типы
+загружаются параллельно, прежний gather 3/2 сохраняется. Отмена waiter не отменяет
+owner; отмена owner освобождает ключ, и waiter повторяет загрузку. Ошибки не
+становятся отрицательным shared cache. Key locks удаляются после последнего caller.
+AsyncClient и async locks принадлежат одному event loop lifespan; общий клиент
+между event loops не используется. Синхронный clear_cache безопасен и из другого
+потока. Нет фоновых задач загрузки, переживающих запрос.
+
+Инвалидация — TTL, LRU eviction, явный `PeopleClient.clear_cache()`, успешный
+`POST /__test/reset`, shutdown/restart. Generation не позволяет старой in-flight
+загрузке восстановить очищенную запись; уже ожидавший caller может получить её
+старый результат. aclose очищает кэш, закрывает HTTPX и запрещает последующие hits.
+Изменение fixtures/config самого people-stub не очищает кэш автоматически: до
+expiry допустимы устаревшие capacity/max_hours/timezone/windows. Для немедленной
+свежести нужен clear/reset или TTL=0. Это локальный TTL-кэш, без distributed
+invalidation и общей атомарной версии profile/availability; выбран явный компромисс
+свежести и количества HTTP. Прежние ошибки/приоритет проверок и BR-05 locks не меняются.
+@lru_cache над async def отвергнут, поскольку сохраняет coroutine вместо результата;
+глобальный lock вокруг HTTP сломал бы параллелизм независимых запросов.
+
 | Требования | Каноническая спецификация | Основная проверка |
 | --- | --- | --- |
 | FR-04, FR-11, NFR-02/03 | catalog-bootstrap | catalog API, WP-01 PostgreSQL |
@@ -250,6 +299,8 @@ INSTRUCTOR_NOT_FOUND в 404 NOT_FOUND, поскольку преподавате
 | FR-13, NFR-01 | lesson-events | events/transport, WP-06 PostgreSQL, E2E-17 |
 | FR-14 (Should) | lesson-series | UTC generator/API, WP-08 PostgreSQL и Alembic cycle |
 | FR-15 (Should), BR-06 | instructor-workload | ISO-недели/DST, API и WP-09 PostgreSQL |
+| FR-16 (Could) | catalog-bootstrap | group page API и WP-10 PostgreSQL |
+| FR-17 (Could), FR-12/NFR-07 | people-client | TTL/concurrency/cancellation, reset и cached create race |
 | NFR-01..07 | quality-and-delivery | static checks, Docker, README/OpenSpec/history |
 
 Спецификации лежат в `openspec/specs/<capability>/spec.md`; сценарии WHEN/THEN
@@ -258,21 +309,22 @@ INSTRUCTOR_NOT_FOUND в 404 NOT_FOUND, поскольку преподавате
 ## Не сделано
 
 Вся обязательная часть **Must, WP-01..WP-07**, реализована и проверена:
-Все 438 тестов Must сохраняются; вместе с WP-08/09 — 578 unit/API/PostgreSQL-тестов.
+Все исходные 438 тестов Must сохраняются; текущий полный набор с WP-08..10 —
+647 unit/API/PostgreSQL-тестов, включая регрессии аудита.
 При WP-06 автор проверил 3 public E2E на полном Docker-стеке
 app + postgres + people-stub + rabbitmq, **3 passed in 9.14s**.
-Should FR-14/15 (WP-08/09) реализованы и проверены PostgreSQL/API-тестами; новый
-сетевой Docker-прогон серии и отчёта в среде ассистента не выполнялся.
-
-В следующие пакеты выделены дополнительные требования:
-
-| Пакет | Приоритет | Содержание |
-| --- | --- | --- |
-| WP-10 | Could, FR-16/17 | Список групп и TTL-кэш people-client |
+Should FR-14/15 (WP-08/09) и Could FR-16/17 (WP-10) реализованы и проверены
+PostgreSQL/API-тестами. Незавершённых функциональных пакетов WP-01..10 нет.
+После аудита Docker-стек проверен на отдельном чистом томе: readiness 200,
+3 public E2E passed in 9.38s. Сетевые smoke-проверки FR-14..16 прошли:
+50 экземпляров серии, поздний конфликт без частичных записей, отчёт и пагинация групп.
 
 Не реализован необязательный transactional outbox. Сетевой Kafka-прогон не выполнялся:
-для сдачи выбран и проверен RabbitMQ. Факт WP-08 — 0,75 ч, итог Must — 4,76 ч.
-Факт WP-09 автор внесёт после завершения. Финальный тег `submission` — после выбранных пакетов.
+для сдачи выбран и проверен RabbitMQ. У TTL-кэша допустима описанная выше задержка
+свежести; общей распределённой инвалидации нет. Это ограничение выбранного решения.
+Факты WP-08/09/10 — 0,66/0,60/0,50 ч; итог Must — 4,76 ч,
+Should/Could — 1,76 ч, общий итог — 6,52 ч. Перед сдачей нужно архивировать
+оставшиеся активные changes и поставить финальный тег `submission` на master после проверок.
 
 ## Async-кейс
 
@@ -304,6 +356,11 @@ uv run pytest tests/unit/test_people_client.py -k original_stub_stats -q
 не входят. Timeout custom transport моделируется `httpx.ReadTimeout`, поскольку
 один asyncio.sleep внутри пользовательского транспорта не включает сетевой timeout
 HTTPX. В рабочем клиенте ограничены connect/read/write/pool таймауты.
+
+После WP-10 замеры выше относятся к **холодному кэшу** (или TTL=0). Тест создаёт
+отдельный PeopleClient для каждой стратегии и по-прежнему достигает max_in_flight
+3/2. Тёплый кэш уменьшает количество реальных HTTP-запросов. Отдельные cache-тесты
+проверяют 20 одновременных callers: один сетевой запрос на ключ и пик 3/2.
 
 ## AI notes
 
@@ -361,7 +418,61 @@ Ruff и strict mypy чисты (83 файла). Проверены 52/53 нед�
 seed I1/2026-W49, все статусы, серия WP-08, локальная полночь и границы недели,
 весенний/осенний DST, равенство/превышение лимита, профиль I6 и 404/502/504.
 Публикаций нет. Новых миграций нет; Docker/e2e-прогон WP-09 не заявляется.
-Факты WP-00..WP-08 и Must 4,76 сохранены; факт WP-09 оставлен пустым.
+Факты WP-00..WP-08 и Must 4,76 сохранены; принятый позднее факт WP-09 — 0,60 ч.
+
+WP-10: через Python прочитаны реальные GroupPage/Limit/Offset и FR-16/17.
+Добавлены страница групп со snapshot COUNT/items и bounded typed TTL/LRU cache.
+Отвергнуты @lru_cache на coroutine, global HTTP lock, кэширование ошибок и связь TTL
+с adjustable Clock. Кэш помещён в clients, SQL — в repositories, snapshot — в
+services; чистые BR не менялись. Clear generation защищает от stale repopulation.
+Конфигурация TTL проведена через Settings, .env.example и Docker Compose.
+
+Результат WP-10: 44 новых isolated/API и 13 PostgreSQL-тестов, полный прогон
+**635 passed in 14.31s** на PostgreSQL 16.2. Ruff и strict mypy чисты (87 файлов).
+Проверены seed/name ties/pages/empty total, единый снимок при конкурентной вставке,
+TTL hit/exact expiry/disable/LRU, три типа, ошибки без negative cache, clear during
+flight, отмена owner/waiter, cross-thread clear, reset без изменения Clock,
+workload с обновлением профиля после expiry и cached concurrent create (201/409).
+Старый gated_people test helper получает TTL=0, поскольку его барьер ждёт
+повторяющиеся HTTP-запросы для проверки SQL-гонок; assertions не ослаблены.
+Нормативные контракты, readiness status/db/broker, модели, миграции и старые BR
+сохранены. Предлагаемые commit/merge headers проверяются lint_commits.py и <=72.
+Принятые факты до WP-09=0,60 сохранены; Must=4,76, до WP-10 всего 6,11 ч.
+Принятый факт WP-10 — 0,50 ч; итог Should/Could — 1,76 ч, общий — 6,52 ч
+(текущие значения из таблицы «Время»).
+
+После аудита FR-14: общий снимок БД под resource locks и конкурентные проверки
+экземпляров через asyncio.to_thread с Semaphore(4). Из workers исключены ORM/SQL;
+prefix snapshots сохраняют BR-06 и внутрисерийные конфликты. Результаты выбираются
+по индексу, запись начинается после успешной проверки всей серии. Добавлены тесты
+ограничения concurrency и первого индекса при обратном порядке завершения ошибок.
+
+Docker-аудит 2026-11-16: изолированный compose project timetable-audit-gate,
+отдельный пустой volume; единственный override отключает публикацию PostgreSQL
+на хост, где порт 5432 уже занят рабочей БД. Сборка, healthchecks и entrypoint
+alembic upgrade head (0001, 0002) прошли; /health/ready вернул 200 с db/broker=ok.
+Public E2E: 3 passed in 9.38s; сетевые smoke FR-14..16 прошли. Временный стек и
+его volume удалены; рабочие таблицы исходного PostgreSQL не затрагивались. Проверка клона по тегу
+submission отложена до подготовки сдачи. Результаты исходных замеров выше сохранены.
+На первом этапе аудита обнаружено, что старый readiness unit-test зависел от
+отсутствия RabbitMQ на localhost. В финальной доработке WP-10 обе probes заменены фейками; окружение
+больше не определяет результат этого unit-теста.
+После удаления временного стека полный прогон с PostgreSQL: **637 passed in 34.42s**.
+Ruff, форматирование, strict mypy (87 файлов) и шесть заголовков README проверены.
+
+Финальная доработка WP-10 закрывает аудит FR-14 и NFR-03/04/05/06. TestTime использует общий строгий
+ISO-парсер: число now даёт 400 BAD_REQUEST, Unix timestamp строкой — 422
+VALIDATION_ERROR; Clock не меняется при отказе. Дробные секунды в сериализации
+Clock оставлены как в scaffold по решению автора. В GitHub Actions добавлен
+PostgreSQL 16 service с healthcheck, в GitLab — такой же service с alias postgres;
+оба check job задают WP01_TEST_DATABASE_URL. Workflow на хостинге будет проверен
+после push; локально проверены YAML/DSN и полный PostgreSQL-набор.
+
+Проверка финального WP-10: **647 passed in 31.71s**, без skips, при реально работающем RabbitMQ;
+ruff, форматирование и strict mypy чисты (87 файлов). Повторная сборка на чистом
+Docker-томе и readiness 200 прошли; public E2E — **3 passed in 9.51s**.
+Сетевые запросы подтвердили 400/422 и сохранение Clock. Временный Docker-стек
+после проверки удалён. Записи о предыдущих прогонах выше сохранены как история.
 
 ## Время
 
@@ -378,6 +489,9 @@ seed I1/2026-W49, все статусы, серия WP-08, локальная п
 | Итого Must, включая WP-00 | 7,45 | 8,50 | 4,76 | — |
 | wp08-create-lesson-series | 1,00 | 1,25 | 0,66 | — |
 | wp09-report-instructor-workload | 0,50 | 0,75 | 0,60 | — |
-| wp10-list-groups-cache-people | 0,50 | 0,75 | | |
-| Итого Should/Could | 2,00 | 2,75 | | |
-| Итого | 9,45 | 11,25 | | |
+| wp10-list-groups-cache-people | 0,50 | 0,75 | 0,50 | — |
+| Итого Should/Could | 2,00 | 2,75 | 1,76 | — |
+| Итого | 9,45 | 11,25 | 6,52 | — |
+
+WP-10 остаётся последним пакетом и включает исправления финального аудита.
+Исходные факты времени сохранены; автор уточняет факт WP-10 и итог с учётом доработок перед сдачей.

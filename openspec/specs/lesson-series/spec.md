@@ -35,12 +35,23 @@ the existing gather batch bounded to 3 for IN_PERSON or 2 for ONLINE (BR-03).
 - **WHEN** the group is absent
 - **THEN** 422 GROUP_NOT_FOUND contains occurrence_index=0 and no people call runs.
 
-### Requirement: Atomic ordered series assessment
-The service SHALL validate each occurrence in index order under sorted resource locks,
-with BR-04..07 considering existing active lessons and earlier same-transaction inserts.
+### Requirement: Atomic bounded concurrent series assessment
+The service SHALL read one snapshot under sorted resource locks and validate occurrences
+concurrently with at most four workers. BR-04..07 SHALL consider existing active lessons
+and earlier generated occurrences. SQL/ORM SHALL stay outside workers; the lowest failing
+index SHALL determine the response regardless of completion order. Inserts SHALL begin
+only after every check succeeds, and locks SHALL remain held through the single commit.
+
+#### Scenario: Bounded occurrence validation
+- **WHEN** a twelve-occurrence series is checked and checks are delayed
+- **THEN** checks overlap with at most four in flight and all finish before persistence.
+
+#### Scenario: Completion order differs from index order
+- **WHEN** occurrence 2 fails before occurrence 1 finishes with a hard violation
+- **THEN** the response contains the violation for occurrence_index=1 and no rows are inserted.
 
 #### Scenario: Late hard violation
-- **WHEN** occurrence 2 conflicts after two valid inserts
+- **WHEN** occurrence 2 conflicts after two valid occurrences
 - **THEN** 409 SCHEDULE_CONFLICT contains occurrence_index=2 and no series row commits.
 
 #### Scenario: Capacity violation

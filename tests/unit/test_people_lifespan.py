@@ -7,6 +7,8 @@ import pytest
 from sqlalchemy.ext.asyncio import AsyncEngine
 
 from app import main
+from app.api import health
+from app.broker import BrokerProbe
 from app.clients.people import PeopleClient
 from app.settings import Settings
 
@@ -46,7 +48,7 @@ async def test_lifespan_closes_people_and_engine(
     assert disposed == [context.engine]
 
 
-async def test_readiness_does_not_call_people_stub() -> None:
+async def test_readiness_does_not_call_people_stub(monkeypatch: pytest.MonkeyPatch) -> None:
     calls: list[httpx.Request] = []
 
     async def fail_if_called(request: httpx.Request) -> httpx.Response:
@@ -55,6 +57,11 @@ async def test_readiness_does_not_call_people_stub() -> None:
 
     settings = Settings(database_url="postgresql+asyncpg://wa:wa@127.0.0.1:1/unreachable")
     context = main.build_context(settings)
+    database_probe = AsyncMock(return_value=False)
+    monkeypatch.setattr(health, "check_database", database_probe)
+    broker_probe = AsyncMock(spec=BrokerProbe)
+    broker_probe.ping.return_value = False
+    context.broker_probe = broker_probe
     assert context.people_client is not None
     await context.people_client.aclose()
     async with PeopleClient(settings, transport=httpx.MockTransport(fail_if_called)) as people:
@@ -73,6 +80,8 @@ async def test_readiness_does_not_call_people_stub() -> None:
                 "broker": "fail",
             }
             assert calls == []
+            database_probe.assert_awaited_once_with(context.engine)
+            broker_probe.ping.assert_awaited_once()
         finally:
             if context.broker_client is not None:
                 await context.broker_client.aclose()
