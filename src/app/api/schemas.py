@@ -1,7 +1,7 @@
 """Схемы чтения из openapi.yaml; все даты сериализуются единым помощником."""
 
 import re
-from datetime import UTC, datetime
+from datetime import UTC, date, datetime
 from typing import Any, Literal
 from uuid import UUID
 
@@ -295,6 +295,19 @@ class LessonWithWarnings(BaseModel):
 class LessonSeriesResult(BaseModel):
     series_id: UUID
     items: list[LessonWithWarnings]
+
+
+class WorkloadDayResponse(BaseModel):
+    date: date
+    hours: float = Field(ge=0)
+    exceeded: bool
+
+
+class WorkloadResponse(BaseModel):
+    instructor_id: UUID
+    week: str
+    max_hours_per_day: float
+    days: list[WorkloadDayResponse] = Field(min_length=7, max_length=7)
 
 
 class LessonPage(BaseModel):

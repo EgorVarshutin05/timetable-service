@@ -12,7 +12,7 @@ from contextlib import AsyncExitStack, asynccontextmanager
 
 from fastapi import FastAPI
 
-from app.api import groups, health, lessons, series, testing
+from app.api import groups, health, instructors, lessons, series, testing
 from app.broker import make_broker
 from app.clients.people import PeopleClient
 from app.clock import AdjustableClock
@@ -106,6 +106,7 @@ def create_app() -> FastAPI:
     app.include_router(groups.router)
     app.include_router(lessons.router)
     app.include_router(series.router)
+    app.include_router(instructors.router)
     # ---> точка расширения: app.include_router(<предметный роутер>)
     return app
 
